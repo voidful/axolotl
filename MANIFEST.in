@@ -4,3 +4,4 @@ include LICENSE
 include src/setuptools_axolotl_dynamic_dependencies.py
 include src/axolotl/utils/chat_templates/templates/*.jinja
 recursive-include axolotl *.py
+recursive-include axolotl *.yaml
