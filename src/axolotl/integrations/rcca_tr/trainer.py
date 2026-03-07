@@ -233,62 +233,29 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         This override explicitly puts the model in eval mode and computes
         CE loss directly, ensuring eval_loss is always populated.
         """
-        from transformers.trainer import Trainer
-        
-        # We must cast the model to eval mode and use torch.no_grad to ensure
-        # that even if DeepSpeed keeps model.training=True (or if the loop 
-        # doesn't), we still get a proper evaluation step without our custom
-        # trust-region loss hijacking it.
-        # But instead of manually doing the forward pass, we rely on the 
-        # base Trainer's robust data gathering and prediction formatting.
-        
+        # Filter inputs to only what the model accepts
+        model_inputs = {
+            k: v for k, v in inputs.items()
+            if k in ("input_ids", "attention_mask", "position_ids", "labels")
+        }
+
         with torch.no_grad():
-            was_training = model.training
             model.eval()
             try:
-                # Call the base class prediction_step which handles all the HF
-                # specific return formats, nested shapes, and prediction_loss_only flags.
-                # However, since `model.eval()` is set, when `Trainer.prediction_step` calls
-                # `self.compute_loss`, it will route directly to the standard CE loss path
-                loss, logits, labels = Trainer.prediction_step(
-                    self, model, inputs, prediction_loss_only, ignore_keys=ignore_keys
-                )
-                
-                # DEBUG PRI:
-                if getattr(self.args, "local_rank", -1) in [-1, 0]:
-                    print(f"[DEBUG-EVAL] After Trainer.prediction_step: loss type={type(loss)} "
-                          f"value={loss if loss is None else loss.item()} "
-                          f"shape={getattr(loss, 'shape', None)} "
-                          f"training={model.training}")
-
+                outputs = model(**model_inputs)
             finally:
-                if was_training:
-                    model.train()
-                    
-        return loss, logits, labels
+                model.train()
 
-    @override
-    def evaluate(
-        self,
-        eval_dataset=None,
-        ignore_keys=None,
-        metric_key_prefix: str = "eval",
-    ):
-        """
-        Safeguard evaluate block: if eval_loss is wiped out by DeepSpeed ZeRO-2 gathering logic,
-        we inject a dummy eval_loss to prevent KeyError crash in load_best_model_at_end downstream.
-        """
-        metrics = super().evaluate(
-            eval_dataset=eval_dataset,
-            ignore_keys=ignore_keys,
-            metric_key_prefix=metric_key_prefix,
+        loss = outputs.loss if outputs.loss is not None else outputs[0]
+
+        if prediction_loss_only:
+            return (loss.detach(), None, None)
+
+        # Return loss + logits + labels for metric computation
+        logits = outputs.logits if hasattr(outputs, "logits") else None
+        labels = inputs.get("labels", None)
+        return (
+            loss.detach(),
+            logits.detach() if logits is not None else None,
+            labels.detach() if labels is not None else None,
         )
-        
-        # DeepSpeed can sometimes drop eval_loss due to gather failures. 
-        # Inject fallback if it completely disappeared to avoid KeyError.
-        loss_key = f"{metric_key_prefix}_loss"
-        if loss_key not in metrics:
-            print(f"[WARNING] {loss_key} was dropped by ZeRO-2 gather! Using fallback 9.99.")
-            metrics[loss_key] = 9.99
-            
-        return metrics
