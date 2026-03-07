@@ -44,7 +44,7 @@ datasets:
 chat_template: qwen3_5
 
 # Training settings
-sequence_len: 2048
+sequence_len: 8000
 sample_packing: true
 pad_to_sequence_len: true
 
