@@ -74,9 +74,17 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         LOG.info("RCCA-TR trainer initialized with frozen model and EMA model.")
 
+    def _get_model_dtype(self):
+        """Get the dtype of the model parameters for autocast."""
+        for param in self.frozen_model.parameters():
+            return param.dtype
+        return torch.float32
+
     def _get_frozen_logits(self, inputs):
-        """Forward pass through frozen model (no grad)."""
-        with torch.no_grad():
+        """Forward pass through frozen model (no grad, with autocast)."""
+        with torch.no_grad(), torch.amp.autocast(
+            device_type="cuda", dtype=self._get_model_dtype()
+        ):
             frozen_inputs = {
                 k: v for k, v in inputs.items()
                 if k in ("input_ids", "attention_mask", "position_ids")
@@ -85,8 +93,10 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             return frozen_outputs.logits
 
     def _get_ema_logits(self, inputs):
-        """Forward pass through EMA model (no grad)."""
-        with torch.no_grad():
+        """Forward pass through EMA model (no grad, with autocast)."""
+        with torch.no_grad(), torch.amp.autocast(
+            device_type="cuda", dtype=self._get_model_dtype()
+        ):
             ema_inputs = {
                 k: v for k, v in inputs.items()
                 if k in ("input_ids", "attention_mask", "position_ids")
@@ -121,7 +131,9 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             # Fall through to recompute if shapes differ
 
         perturbation_logits = []
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(
+            device_type="cuda", dtype=self._get_model_dtype()
+        ):
             pert_inputs = {
                 k: v for k, v in inputs.items()
                 if k in ("input_ids", "attention_mask", "position_ids")
