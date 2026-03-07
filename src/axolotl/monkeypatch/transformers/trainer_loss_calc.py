@@ -92,6 +92,23 @@ def patch_evaluation_loop():
     Trainer.evaluation_loop = axolotl_evaluation_loop
 
 
+def patch_printer_callback():
+    from transformers.trainer_callback import PrinterCallback
+    from axolotl.utils.distributed import is_main_process
+
+    if hasattr(PrinterCallback, "_original_on_log"):
+        return
+
+    PrinterCallback._original_on_log = PrinterCallback.on_log
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if is_main_process():
+            self._original_on_log(args, state, control, logs=logs, **kwargs)
+
+    PrinterCallback.on_log = on_log
+    LOG.debug("Patched PrinterCallback.on_log to only print on main process")
+
+
 def check_maybe_log_save_evaluate_is_patchable() -> bool:
     maybe_log_source = inspect.getsource(Trainer._maybe_log_save_evaluate)
     return ORIGINAL_MAYBE_CODE in maybe_log_source

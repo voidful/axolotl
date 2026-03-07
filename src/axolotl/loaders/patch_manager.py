@@ -124,10 +124,12 @@ class PatchManager:
         from axolotl.monkeypatch.transformers.trainer_loss_calc import (
             patch_evaluation_loop,
             patch_maybe_log_save_evaluate,
+            patch_printer_callback,
         )
 
         patch_evaluation_loop()
         patch_maybe_log_save_evaluate()
+        patch_printer_callback()
 
         if self.cfg.context_parallel_size > 1:
             from axolotl.monkeypatch.transformers.trainer_context_parallel import (
