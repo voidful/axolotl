@@ -76,3 +76,6 @@ metric_for_best_model: eval_loss
 greater_is_better: false
 
 output_dir: ./outputs/rcca-tr-fft
+
+log_on_each_node: false
+logging_steps: 1
