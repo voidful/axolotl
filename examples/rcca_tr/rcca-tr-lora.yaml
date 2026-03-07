@@ -1,0 +1,64 @@
+# Example config for RCCA-TR (Reliability-Calibrated Conflict-Aware Trust-Region) full fine-tuning
+# This requires ~3x model memory (active + frozen + EMA)
+
+base_model: Qwen/Qwen3.5-9B
+
+plugins:
+  - axolotl.integrations.rcca_tr.RCCATRPlugin
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+# Enable RCCA-TR trainer
+rcca_tr_trainer: true
+
+# Conflict score hyperparameters
+rcca_tr_conflict_lambda1: 1.0      # weight for surprisal in conflict score
+rcca_tr_conflict_lambda2: 0.5      # weight for margin-based conflict
+rcca_tr_conflict_tau: 1.0          # temperature for conflict sigmoid
+
+# Reliability score hyperparameters
+rcca_tr_reliability_beta: 0.5      # balance between stability and evidence
+rcca_tr_reliability_tau: 1.0       # temperature for reliability sigmoid
+
+# Trust-region hyperparameters
+rcca_tr_epsilon_min: 0.01          # minimum trust-region radius
+rcca_tr_epsilon_max: 1.0           # maximum trust-region radius
+rcca_tr_kl_lambda: 1.0             # Lagrange multiplier for KL penalty
+rcca_tr_use_smooth_objective: true  # smooth g(r_t)*KL vs hinge
+
+# EMA hyperparameters
+rcca_tr_ema_decay: 0.999           # EMA decay rate
+
+# Stability estimation
+rcca_tr_num_perturbations: 3       # dropout perturbation count
+rcca_tr_stability_update_interval: 50  # steps between stability refreshes
+
+# Dataset
+datasets:
+  - path: voidful/gemini-3.1-opus-4.6-reasoning-merged
+    type: chat_template
+    split: train
+
+chat_template: qwen3_5
+
+# Training settings
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+num_epochs: 1
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 2e-5
+
+bf16: auto
+gradient_checkpointing: true
+flash_attention: true
+
+val_set_size: 0.05
+
+output_dir: ./outputs/rcca-tr-fft
