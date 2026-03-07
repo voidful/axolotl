@@ -233,38 +233,29 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         This override explicitly puts the model in eval mode and computes
         CE loss directly, ensuring eval_loss is always populated.
         """
-        # Filter inputs to only what the model accepts
-        model_inputs = {
-            k: v for k, v in inputs.items()
-            if k in ("input_ids", "attention_mask", "position_ids", "labels")
-        }
-
+        from transformers.trainer import Trainer
+        
+        # We must cast the model to eval mode and use torch.no_grad to ensure
+        # that even if DeepSpeed keeps model.training=True (or if the loop 
+        # doesn't), we still get a proper evaluation step without our custom
+        # trust-region loss hijacking it.
+        # But instead of manually doing the forward pass, we rely on the 
+        # base Trainer's robust data gathering and prediction formatting.
+        
         with torch.no_grad():
+            was_training = model.training
             model.eval()
             try:
-                outputs = model(**model_inputs)
+                # Call the base class prediction_step which handles all the HF
+                # specific return formats, nested shapes, and prediction_loss_only flags.
+                # However, since `model.eval()` is set, when `Trainer.prediction_step` calls
+                # `self.compute_loss`, it will route directly to the standard CE loss path
+                # we added in our `compute_loss` override.
+                loss, logits, labels = Trainer.prediction_step(
+                    self, model, inputs, prediction_loss_only, ignore_keys=ignore_keys
+                )
             finally:
-                model.train()
-
-        loss = outputs.loss if outputs.loss is not None else outputs[0]
-
-        # Ensure loss is at least 1D for proper gathering across GPUs
-        if loss.numel() == 1 and loss.dim() == 0:
-            loss = loss.unsqueeze(0)
-            
-        # Optional: replicate the loss across the batch size so that Trainer's 
-        # gather logic correctly weights it when computing the final mean
-        batch_size = inputs["input_ids"].shape[0] if "input_ids" in inputs else 1
-        loss = loss.repeat(batch_size)
-
-        if prediction_loss_only:
-            return (loss.detach(), None, None)
-
-        # Return loss + logits + labels for metric computation
-        logits = outputs.logits if hasattr(outputs, "logits") else None
-        labels = inputs.get("labels", None)
-        return (
-            loss.detach(),
-            logits.detach() if logits is not None else None,
-            labels.detach() if labels is not None else None,
-        )
+                if was_training:
+                    model.train()
+                    
+        return loss, logits, labels
