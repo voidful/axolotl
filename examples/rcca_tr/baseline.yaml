@@ -1,0 +1,66 @@
+# Baseline config for standard LoRA fine-tuning (without RCCA-TR)
+base_model: Qwen/Qwen3.5-9B
+
+plugins:
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+# Enable standard LoRA
+adapter: lora
+peft:
+  lora_r: 32
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+    - gate_proj
+    - down_proj
+    - up_proj
+
+# Dataset
+datasets:
+  - path: voidful/gemini-3.1-opus-4.6-reasoning-merged
+    type: chat_template
+    split: train
+
+dataset_prepared_path: ./prepared_data/baseline
+
+chat_template: qwen3_5
+
+# Training settings
+sequence_len: 16384
+sample_packing: true
+pad_to_sequence_len: true
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+num_epochs: 3
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2e-5
+
+bf16: true
+gradient_checkpointing: true
+flash_attention: true
+
+dataloader_num_workers: 0
+
+deepspeed: deepspeed_configs/zero2.json
+
+val_set_size: 0.05
+
+save_strategy: epoch
+
+output_dir: ./outputs/baseline-lora
+
+hub_model_id: voidful/Qwen3.5-9B-gemini-3.1-opus-4.6-reasoning-lora-baseline
+push_to_hub: true
+hub_strategy: end
+
+log_on_each_node: false
+logging_steps: 1
