@@ -45,10 +45,10 @@ class FileLockLoader:
 
     def _increment_counter(self):
         """Safely increment the process counter."""
-        if self.counter_path.exists():
+        try:
             counter_content = self.counter_path.read_text().strip()
             count = int(counter_content) if counter_content else 0
-        else:
+        except FileNotFoundError:
             count = 0
         self.counter_path.write_text(str(count + 1))
 
