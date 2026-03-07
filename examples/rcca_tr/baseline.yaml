@@ -9,18 +9,17 @@ liger_glu_activation: true
 
 # Enable standard LoRA
 adapter: lora
-peft:
-  lora_r: 32
-  lora_alpha: 16
-  lora_dropout: 0.05
-  lora_target_modules:
-    - q_proj
-    - v_proj
-    - k_proj
-    - o_proj
-    - gate_proj
-    - down_proj
-    - up_proj
+lora_r: 32
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - v_proj
+  - k_proj
+  - o_proj
+  - gate_proj
+  - down_proj
+  - up_proj
 
 # Dataset
 datasets:
