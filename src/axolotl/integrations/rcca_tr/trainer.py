@@ -248,6 +248,15 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         loss = outputs.loss if outputs.loss is not None else outputs[0]
 
+        # Ensure loss is at least 1D for proper gathering across GPUs
+        if loss.numel() == 1 and loss.dim() == 0:
+            loss = loss.unsqueeze(0)
+            
+        # Optional: replicate the loss across the batch size so that Trainer's 
+        # gather logic correctly weights it when computing the final mean
+        batch_size = inputs["input_ids"].shape[0] if "input_ids" in inputs else 1
+        loss = loss.repeat(batch_size)
+
         if prediction_loss_only:
             return (loss.detach(), None, None)
 
