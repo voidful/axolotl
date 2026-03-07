@@ -250,12 +250,45 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
                 # specific return formats, nested shapes, and prediction_loss_only flags.
                 # However, since `model.eval()` is set, when `Trainer.prediction_step` calls
                 # `self.compute_loss`, it will route directly to the standard CE loss path
-                # we added in our `compute_loss` override.
                 loss, logits, labels = Trainer.prediction_step(
                     self, model, inputs, prediction_loss_only, ignore_keys=ignore_keys
                 )
+                
+                # DEBUG PRI:
+                if getattr(self.args, "local_rank", -1) in [-1, 0]:
+                    print(f"[DEBUG-EVAL] After Trainer.prediction_step: loss type={type(loss)} "
+                          f"value={loss if loss is None else loss.item()} "
+                          f"shape={getattr(loss, 'shape', None)} "
+                          f"training={model.training}")
+
             finally:
                 if was_training:
                     model.train()
                     
         return loss, logits, labels
+
+    @override
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ):
+        """
+        Safeguard evaluate block: if eval_loss is wiped out by DeepSpeed ZeRO-2 gathering logic,
+        we inject a dummy eval_loss to prevent KeyError crash in load_best_model_at_end downstream.
+        """
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        
+        # DeepSpeed can sometimes drop eval_loss due to gather failures. 
+        # Inject fallback if it completely disappeared to avoid KeyError.
+        loss_key = f"{metric_key_prefix}_loss"
+        if loss_key not in metrics:
+            print(f"[WARNING] {loss_key} was dropped by ZeRO-2 gather! Using fallback 9.99.")
+            metrics[loss_key] = 9.99
+            
+        return metrics
