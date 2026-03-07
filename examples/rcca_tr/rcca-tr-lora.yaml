@@ -40,6 +40,7 @@ rcca_tr_drift_gamma: 1.0           # drift → reliability scaling
 datasets:
   - path: voidful/earica_text_train
     type: chat_template
+    field_messages: conversations
     split: train
 
 dataset_prepared_path: ./prepared_data/rcca_tr
