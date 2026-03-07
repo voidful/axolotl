@@ -216,3 +216,46 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         )
 
         return (loss, outputs) if return_outputs else loss
+
+    @override
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        """
+        Override prediction_step to use standard CE loss during eval.
+
+        The default Trainer.prediction_step calls compute_loss, but under
+        DeepSpeed ZeRO-2, model.training may still be True during eval.
+        This override explicitly puts the model in eval mode and computes
+        CE loss directly, ensuring eval_loss is always populated.
+        """
+        # Filter inputs to only what the model accepts
+        model_inputs = {
+            k: v for k, v in inputs.items()
+            if k in ("input_ids", "attention_mask", "position_ids", "labels")
+        }
+
+        with torch.no_grad():
+            model.eval()
+            try:
+                outputs = model(**model_inputs)
+            finally:
+                model.train()
+
+        loss = outputs.loss if outputs.loss is not None else outputs[0]
+
+        if prediction_loss_only:
+            return (loss.detach(), None, None)
+
+        # Return loss + logits + labels for metric computation
+        logits = outputs.logits if hasattr(outputs, "logits") else None
+        labels = inputs.get("labels", None)
+        return (
+            loss.detach(),
+            logits.detach() if logits is not None else None,
+            labels.detach() if labels is not None else None,
+        )
