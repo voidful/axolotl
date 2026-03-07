@@ -124,12 +124,8 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         """
         Compute the RCCA-TR A+ trust-region loss.
 
-        Steps:
-            1. Forward pass through active model → p_θ (only model forward)
-            2. Read cached prior values from inputs (no frozen forward)
-            3. Compute conflict score α_t from cache
-            4. Compute drift and reliability r_t (no EMA forward)
-            5. Compute trust-region loss with KL proxy
+        During training: uses conflict score + drift buffer + KL proxy.
+        During eval: falls back to standard CE loss for proper eval_loss metric.
         """
         # Handle sample packing
         if (
@@ -142,8 +138,14 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         if num_items_in_batch is None and "labels" in inputs:
             num_items_in_batch = (inputs["labels"] != -100).sum().item()
 
-        # 1. Forward pass through active model (the ONLY model forward)
+        # Forward pass through active model
         outputs = model(**inputs)
+
+        # During eval, use standard CE loss (trust-region doesn't apply)
+        if not model.training:
+            loss = outputs.loss if outputs.loss is not None else outputs[0]
+            return (loss, outputs) if return_outputs else loss
+
         active_logits = outputs.logits  # (B, T, V)
 
         labels = inputs.get("labels", None)
