@@ -53,7 +53,7 @@ pad_to_sequence_len: true
 
 gradient_accumulation_steps: 4
 micro_batch_size: 1
-num_epochs: 5
+num_epochs: 10
 optimizer: adamw_torch_fused
 lr_scheduler: cosine
 learning_rate: 2e-5
