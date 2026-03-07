@@ -60,6 +60,8 @@ bf16: true
 gradient_checkpointing: true
 flash_attention: true
 
+dataloader_num_workers: 0
+
 deepspeed: deepspeed_configs/zero2.json
 
 val_set_size: 0.05
