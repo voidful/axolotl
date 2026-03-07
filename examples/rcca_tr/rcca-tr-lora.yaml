@@ -42,6 +42,8 @@ datasets:
     type: chat_template
     split: train
 
+dataset_prepared_path: ./prepared_data/rcca_tr
+
 chat_template: qwen3_5
 
 # Training settings
