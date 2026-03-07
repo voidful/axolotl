@@ -7,19 +7,7 @@ plugins:
 liger_rms_norm: true
 liger_glu_activation: true
 
-# Enable standard LoRA
-adapter: lora
-lora_r: 32
-lora_alpha: 16
-lora_dropout: 0.05
-lora_target_modules:
-  - q_proj
-  - v_proj
-  - k_proj
-  - o_proj
-  - gate_proj
-  - down_proj
-  - up_proj
+# Enable Full Fine-Tuning (no adapter)
 
 # Dataset
 datasets:
@@ -55,9 +43,9 @@ val_set_size: 0.05
 
 save_strategy: epoch
 
-output_dir: ./outputs/baseline-lora
+output_dir: ./outputs/baseline-fft
 
-hub_model_id: voidful/Qwen3.5-9B-gemini-3.1-opus-4.6-reasoning-lora-baseline
+hub_model_id: voidful/Qwen3.5-9B-gemini-3.1-opus-4.6-reasoning-fft-baseline
 push_to_hub: true
 hub_strategy: end
 
