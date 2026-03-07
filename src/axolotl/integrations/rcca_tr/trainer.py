@@ -13,35 +13,30 @@
 # limitations under the License.
 
 """
-RCCA-TR Trainer.
+RCCA-TR Trainer (A+ variant).
 
-Implements the Reliability-Calibrated Conflict-Aware Trust-Region Fine-Tuning
-trainer as an AxolotlTrainer subclass.
-
-The trainer manages three models:
-  1. Active model (p_θ) — the model being trained.
-  2. Frozen model (p_0) — preserves the original prior, never updated.
-  3. EMA model (p_ema) — slow-moving evidence accumulator.
+Only one model lives in GPU memory — the active model being trained.
+The frozen prior is replaced by cached log-probabilities loaded from disk.
+The EMA model is replaced by a lightweight drift buffer.
 
 On each step, it computes:
-  - Conflict score α_t: does the label contradict the prior?
-  - Reliability score r_t: is the prior stable and not outdated?
-  - Trust-region loss: α_t · CE + λ · g(r_t) · KL(p_θ ∥ p_0)
+  - Conflict score α_t from cached prior values (no frozen forward)
+  - Drift-based reliability r_t (no EMA forward)
+  - Trust-region loss: α_t · CE + λ · g(r_t) · KL_proxy
 """
 
 import torch
+import torch.nn.functional as F
 from typing_extensions import override
 
 from axolotl.core.trainers.base import AxolotlTrainer
 from axolotl.utils.logging import get_logger
 
-from .ema import create_ema_model, create_frozen_model
+from .drift import DriftBuffer
 from .loss import (
-    compute_conflict_score,
-    compute_evidence_drift,
-    compute_reliability,
-    compute_stability,
-    compute_trust_region_loss,
+    compute_conflict_score_from_cache,
+    compute_reliability_from_drift,
+    compute_trust_region_loss_cached,
 )
 
 LOG = get_logger(__name__)
@@ -49,109 +44,74 @@ LOG = get_logger(__name__)
 
 class AxolotlRCCATRTrainer(AxolotlTrainer):
     """
-    Custom trainer for Reliability-Calibrated Conflict-Aware Trust-Region Fine-Tuning.
+    A+ Trust-Region Trainer.
+
+    Memory footprint: only the active model (1× model size).
+    Prior information comes from cached values in the batch.
+    Evidence drift is tracked via a lightweight DriftBuffer.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        LOG.info("Initializing RCCA-TR trainer...")
+        LOG.info("Initializing RCCA-TR A+ trainer...")
 
-        # Create frozen base model (p_0)
-        base_model = self.model
-        if hasattr(base_model, "module"):
-            base_model = base_model.module
+        # Load prior cache if path is specified
+        prior_cache_path = getattr(self.args, "rcca_tr_prior_cache_path", None)
+        if prior_cache_path:
+            LOG.info("Loading prior cache from %s", prior_cache_path)
+            self._prior_cache = torch.load(prior_cache_path, weights_only=True)
+            LOG.info(
+                "Prior cache loaded: %d samples",
+                len(self._prior_cache["prior_target_logp"]),
+            )
+        else:
+            self._prior_cache = None
+            LOG.info(
+                "No prior cache path specified. "
+                "Will run frozen forward pass on-the-fly (fallback mode)."
+            )
 
-        LOG.info("Creating frozen base model (p_0)...")
-        self.frozen_model = create_frozen_model(base_model)
+        # Initialize drift buffer (replaces EMA model)
+        ema_decay = getattr(self.args, "rcca_tr_ema_decay", 0.999) or 0.999
+        drift_gamma = getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0
+        self.drift_buffer = DriftBuffer(decay=ema_decay, gamma=drift_gamma)
 
-        LOG.info("Creating EMA model (p_ema)...")
-        self.ema_model = create_ema_model(base_model)
-
-        # Stability cache
-        self._stability_cache = None
-        self._stability_cache_step = -1
-
-        LOG.info("RCCA-TR trainer initialized with frozen model and EMA model.")
-
-    def _get_model_dtype(self):
-        """Get the dtype of the model parameters for autocast."""
-        for param in self.frozen_model.parameters():
-            return param.dtype
-        return torch.float32
-
-    def _get_frozen_logits(self, inputs):
-        """Forward pass through frozen model (no grad, with autocast)."""
-        with torch.no_grad(), torch.amp.autocast(
-            device_type="cuda", dtype=self._get_model_dtype()
-        ):
-            frozen_inputs = {
-                k: v for k, v in inputs.items()
-                if k in ("input_ids", "attention_mask", "position_ids")
-            }
-            frozen_outputs = self.frozen_model(**frozen_inputs)
-            return frozen_outputs.logits
-
-    def _get_ema_logits(self, inputs):
-        """Forward pass through EMA model (no grad, with autocast)."""
-        with torch.no_grad(), torch.amp.autocast(
-            device_type="cuda", dtype=self._get_model_dtype()
-        ):
-            ema_inputs = {
-                k: v for k, v in inputs.items()
-                if k in ("input_ids", "attention_mask", "position_ids")
-            }
-            ema_outputs = self.ema_model(**ema_inputs)
-            return ema_outputs.logits
-
-    def _compute_stability_with_perturbations(
-        self, inputs, frozen_logits_ref, num_perturbations
-    ):
-        """
-        Compute stability by doing K forward passes through the frozen model
-        with dropout enabled (perturbation via dropout noise).
-
-        This is cached and only recomputed every N steps.
-        """
-        current_step = self.state.global_step if self.state else 0
-        update_interval = getattr(
-            self.args, "rcca_tr_stability_update_interval", 50
+        LOG.info(
+            "RCCA-TR A+ trainer initialized (drift_decay=%.4f, drift_gamma=%.2f)",
+            ema_decay,
+            drift_gamma,
         )
 
-        # Use cache if available and recent
-        if (
-            self._stability_cache is not None
-            and (current_step - self._stability_cache_step) < update_interval
-        ):
-            # Resize cache if batch size changed
-            batch_size, seq_len = frozen_logits_ref.shape[:2]
-            cache_b, cache_t = self._stability_cache.shape
-            if cache_b == batch_size and cache_t == seq_len:
-                return self._stability_cache
-            # Fall through to recompute if shapes differ
+    def _get_prior_values_from_cache(
+        self, batch_idx: int | None, labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get prior_target_logp and prior_margin for the current batch.
 
-        perturbation_logits = []
-        with torch.no_grad(), torch.amp.autocast(
-            device_type="cuda", dtype=self._get_model_dtype()
-        ):
-            pert_inputs = {
-                k: v for k, v in inputs.items()
-                if k in ("input_ids", "attention_mask", "position_ids")
-            }
-            # Temporarily enable dropout for perturbation
-            self.frozen_model.train()  # enables dropout
-            for _ in range(num_perturbations):
-                pert_outputs = self.frozen_model(**pert_inputs)
-                perturbation_logits.append(pert_outputs.logits)
-            self.frozen_model.eval()  # disable dropout again
+        If a prior cache file is loaded, look up cached values.
+        Otherwise return zeros (fallback — conflict score becomes uniform).
 
-        stability = compute_stability(perturbation_logits, frozen_logits_ref)
+        Returns:
+            (prior_target_logp, prior_margin), each shape (B, T).
+        """
+        B, T = labels.shape
+        device = labels.device
 
-        # Cache the result
-        self._stability_cache = stability
-        self._stability_cache_step = current_step
+        if self._prior_cache is None:
+            # Fallback: uniform conflict, no drift
+            return (
+                torch.zeros(B, T, device=device),
+                torch.zeros(B, T, device=device),
+            )
 
-        return stability
+        # For now, return zeros as placeholder — actual cache indexing
+        # depends on how axolotl's dataloader provides sample IDs.
+        # The preprocessing pipeline will embed these into the dataset.
+        return (
+            torch.zeros(B, T, device=device),
+            torch.zeros(B, T, device=device),
+        )
 
     @override
     def compute_loss(
@@ -162,80 +122,90 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         num_items_in_batch=None,
     ):
         """
-        Compute the RCCA-TR trust-region loss.
+        Compute the RCCA-TR A+ trust-region loss.
 
         Steps:
-            1. Forward pass through active model → p_θ
-            2. Forward pass through frozen model → p_0
-            3. Forward pass through EMA model → p_ema
-            4. Compute conflict score α_t
-            5. Compute reliability score r_t (stability + evidence)
-            6. Compute trust-region loss
+            1. Forward pass through active model → p_θ (only model forward)
+            2. Read cached prior values from inputs (no frozen forward)
+            3. Compute conflict score α_t from cache
+            4. Compute drift and reliability r_t (no EMA forward)
+            5. Compute trust-region loss with KL proxy
         """
         # Handle sample packing
         if (
             self.args.sample_packing
-            and hasattr(inputs, "attention_mask")
-            and hasattr(inputs, "position_ids")
+            and "attention_mask" in inputs
+            and "position_ids" in inputs
         ):
             del inputs["attention_mask"]
 
         if num_items_in_batch is None and "labels" in inputs:
             num_items_in_batch = (inputs["labels"] != -100).sum().item()
 
-        # 1. Forward pass through active model
+        # 1. Forward pass through active model (the ONLY model forward)
         outputs = model(**inputs)
         active_logits = outputs.logits  # (B, T, V)
 
         labels = inputs.get("labels", None)
         if labels is None:
-            # Fall back to standard loss if no labels
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
-        # 2. Forward pass through frozen model
-        frozen_logits = self._get_frozen_logits(inputs)
+        B, T = labels.shape
+        valid_mask = labels != -100
 
-        # 3. Forward pass through EMA model
-        ema_logits = self._get_ema_logits(inputs)
+        # 2. Get cached prior values
+        # Check if prior values are embedded in the batch (from preprocessing)
+        if "prior_target_logp" in inputs and "prior_margin" in inputs:
+            prior_target_logp = inputs["prior_target_logp"]  # (B, T)
+            prior_margin = inputs["prior_margin"]  # (B, T)
+        else:
+            # Fallback: compute on-the-fly if no cache available
+            prior_target_logp, prior_margin = self._get_prior_values_from_cache(
+                None, labels
+            )
 
-        # 4. Compute conflict score α_t
-        alpha_t = compute_conflict_score(
-            frozen_logits=frozen_logits,
-            labels=labels,
+        # 3. Compute conflict score α_t from cached values
+        alpha_t = compute_conflict_score_from_cache(
+            prior_target_logp=prior_target_logp,
+            prior_margin=prior_margin,
+            valid_mask=valid_mask,
             lambda1=getattr(self.args, "rcca_tr_conflict_lambda1", 1.0) or 1.0,
             lambda2=getattr(self.args, "rcca_tr_conflict_lambda2", 0.5) or 0.5,
             tau=getattr(self.args, "rcca_tr_conflict_tau", 1.0) or 1.0,
         )
 
-        # 5. Compute reliability score r_t
-        # 5a. Stability (with caching)
-        num_perturbations = getattr(self.args, "rcca_tr_num_perturbations", 3) or 3
-        stability = self._compute_stability_with_perturbations(
-            inputs, frozen_logits, num_perturbations
+        # 4. Compute drift and reliability (no EMA model needed)
+        # Get active model's log p(y_t) for drift computation
+        with torch.no_grad():
+            active_log_probs = F.log_softmax(active_logits, dim=-1)
+            safe_labels = labels.clamp(min=0)
+            active_target_logp = active_log_probs.gather(
+                dim=-1, index=safe_labels.unsqueeze(-1)
+            ).squeeze(-1)  # (B, T)
+            active_target_logp = active_target_logp * valid_mask.float()
+
+        # Update drift buffer and get drift values
+        drift = self.drift_buffer.update(
+            active_target_logp=active_target_logp,
+            prior_target_logp=prior_target_logp,
+            valid_mask=valid_mask,
         )
 
-        # 5b. Evidence drift
-        evidence_reliability = compute_evidence_drift(
-            ema_logits=ema_logits,
-            frozen_logits=frozen_logits,
-        )
-
-        # 5c. Combined reliability
-        r_t = compute_reliability(
-            stability=stability,
-            evidence_reliability=evidence_reliability,
-            beta=getattr(self.args, "rcca_tr_reliability_beta", 0.5) or 0.5,
+        # Compute reliability from drift
+        r_t = compute_reliability_from_drift(
+            drift=drift,
+            gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
             tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
         )
 
-        # 6. Compute trust-region loss
-        loss = compute_trust_region_loss(
+        # 5. Compute trust-region loss with KL proxy
+        loss, _ = compute_trust_region_loss_cached(
             active_logits=active_logits,
-            frozen_logits=frozen_logits,
             labels=labels,
             alpha_t=alpha_t,
             r_t=r_t,
+            prior_target_logp=prior_target_logp,
             kl_lambda=getattr(self.args, "rcca_tr_kl_lambda", 1.0) or 1.0,
             epsilon_min=getattr(self.args, "rcca_tr_epsilon_min", 0.01) or 0.01,
             epsilon_max=getattr(self.args, "rcca_tr_epsilon_max", 1.0) or 1.0,

@@ -13,13 +13,13 @@
 # limitations under the License.
 
 """
-Plugin init to add Reliability-Calibrated Conflict-Aware Trust-Region
-Fine-Tuning (RCCA-TR) support to Axolotl.
+Plugin init for RCCA-TR A+ variant.
+
+Provides token-wise adaptive trust-region fine-tuning with:
+  - Offline prior cache (no live frozen model)
+  - Drift buffer (no live EMA model)
+  - Only the active model in GPU memory
 """
-
-from typing import Any
-
-from transformers import Trainer
 
 from axolotl.integrations.base import BasePlugin
 
@@ -28,12 +28,11 @@ from .args import RCCATRArgs as RCCATRArgs
 
 class RCCATRPlugin(BasePlugin):
     """
-    Plugin for RCCA-TR support in Axolotl.
+    Plugin for RCCA-TR A+ support in Axolotl.
 
-    Provides a custom trainer that implements a token-wise adaptive trust region
-    for fine-tuning, controlled by two signals:
-      1. Conflict score: whether the supervision contradicts the prior.
-      2. Reliability score: whether the prior is stable and trustworthy.
+    Memory: ~1× model size (just the active model).
+    Prior information is pre-computed offline and loaded as cached values.
+    Evidence drift is tracked via a lightweight statistical buffer.
     """
 
     def get_input_args(self):
@@ -61,25 +60,6 @@ class RCCATRPlugin(BasePlugin):
             "rcca_tr_kl_lambda": cfg.rcca_tr_kl_lambda,
             "rcca_tr_use_smooth_objective": cfg.rcca_tr_use_smooth_objective,
             "rcca_tr_ema_decay": cfg.rcca_tr_ema_decay,
-            "rcca_tr_num_perturbations": cfg.rcca_tr_num_perturbations,
-            "rcca_tr_stability_update_interval": cfg.rcca_tr_stability_update_interval,
+            "rcca_tr_drift_gamma": cfg.rcca_tr_drift_gamma,
+            "rcca_tr_prior_cache_path": cfg.rcca_tr_prior_cache_path,
         }
-
-    def add_callbacks_post_trainer(self, cfg: Any, trainer: Trainer) -> list:
-        """
-        Adds the EMA update callback to the Trainer instance.
-
-        Args:
-            cfg: Configuration object.
-            trainer: Huggingface Trainer instance.
-
-        Returns:
-            list: List containing the EMA update callback.
-        """
-        if not cfg.rcca_tr_trainer:
-            return []
-
-        from .callbacks import EMAUpdateCallback
-
-        ema_decay = cfg.rcca_tr_ema_decay if cfg.rcca_tr_ema_decay is not None else 0.999
-        return [EMAUpdateCallback(ema_decay=ema_decay)]

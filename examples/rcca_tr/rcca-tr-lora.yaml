@@ -1,5 +1,6 @@
-# Example config for RCCA-TR (Reliability-Calibrated Conflict-Aware Trust-Region) full fine-tuning
-# This requires ~3x model memory (active + frozen + EMA)
+# Example config for RCCA-TR A+ (Reliability-Calibrated Conflict-Aware Trust-Region) fine-tuning
+# A+ variant: only 1 model in GPU memory (active model)
+# Prior = offline cache, EMA = drift buffer
 
 base_model: Qwen/Qwen3.5-9B
 
@@ -28,12 +29,12 @@ rcca_tr_epsilon_max: 1.0           # maximum trust-region radius
 rcca_tr_kl_lambda: 1.0             # Lagrange multiplier for KL penalty
 rcca_tr_use_smooth_objective: true  # smooth g(r_t)*KL vs hinge
 
-# EMA hyperparameters
-rcca_tr_ema_decay: 0.999           # EMA decay rate
+# Drift buffer (replaces EMA model)
+rcca_tr_ema_decay: 0.999           # decay rate for drift buffer
+rcca_tr_drift_gamma: 1.0           # drift → reliability scaling
 
-# Stability estimation
-rcca_tr_num_perturbations: 3       # dropout perturbation count
-rcca_tr_stability_update_interval: 50  # steps between stability refreshes
+# Prior cache (optional; omit to use fallback mode)
+# rcca_tr_prior_cache_path: ./prior_cache/prior_cache.pt
 
 # Dataset
 datasets:
@@ -51,14 +52,15 @@ pad_to_sequence_len: true
 gradient_accumulation_steps: 4
 micro_batch_size: 1
 num_epochs: 5
-optimizer: adamw_torch
+optimizer: adamw_torch_fused
 lr_scheduler: cosine
 learning_rate: 2e-5
 
-bf16: auto
+bf16: true
 gradient_checkpointing: true
-flash_attention: false
-sdpa: true
+flash_attention: true
+
+deepspeed: deepspeed_configs/zero2.json
 
 val_set_size: 0.05
 

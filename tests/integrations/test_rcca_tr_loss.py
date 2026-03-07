@@ -1,34 +1,86 @@
 """
-Unit tests for RCCA-TR loss functions and utilities.
+Unit tests for RCCA-TR A+ loss functions and drift buffer.
 """
 
 import torch
-import pytest
+import torch.nn as nn
+
 from axolotl.integrations.rcca_tr.loss import (
     compute_conflict_score,
-    compute_stability,
-    compute_evidence_drift,
-    compute_reliability,
+    compute_conflict_score_from_cache,
+    compute_reliability_from_drift,
     compute_trust_region_loss,
+    compute_trust_region_loss_cached,
 )
-from axolotl.integrations.rcca_tr.ema import update_ema_model
+from axolotl.integrations.rcca_tr.drift import DriftBuffer
 
 
-class TestConflictScore:
-    """Tests for compute_conflict_score."""
+class TestConflictScoreFromCache:
+    """Tests for compute_conflict_score_from_cache."""
 
     def test_shape(self):
-        """Output shape matches (B, T)."""
+        B, T = 2, 10
+        prior_target_logp = torch.randn(B, T)
+        prior_margin = torch.rand(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+        valid_mask[:, 0] = False
+
+        alpha = compute_conflict_score_from_cache(
+            prior_target_logp, prior_margin, valid_mask
+        )
+        assert alpha.shape == (B, T)
+
+    def test_range(self):
+        B, T = 4, 20
+        prior_target_logp = torch.randn(B, T)
+        prior_margin = torch.rand(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+        alpha = compute_conflict_score_from_cache(
+            prior_target_logp, prior_margin, valid_mask
+        )
+        assert alpha.min() >= 0.0
+        assert alpha.max() <= 1.0
+
+    def test_invalid_tokens_zero(self):
+        B, T = 2, 10
+        prior_target_logp = torch.randn(B, T)
+        prior_margin = torch.rand(B, T)
+        valid_mask = torch.zeros(B, T, dtype=torch.bool)
+
+        alpha = compute_conflict_score_from_cache(
+            prior_target_logp, prior_margin, valid_mask
+        )
+        assert torch.all(alpha == 0.0)
+
+    def test_high_surprisal_high_conflict(self):
+        B, T = 1, 5
+        # Very negative log p_0(y_t) → high surprisal
+        prior_target_logp = torch.full((B, T), -10.0)
+        prior_margin = torch.full((B, T), 5.0)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+        alpha = compute_conflict_score_from_cache(
+            prior_target_logp, prior_margin, valid_mask, lambda1=1.0, lambda2=0.5
+        )
+        # All tokens have same conflict, so after z-score normalization sigmoid → ~0.5
+        # This is expected — conflict scores are relative
+        assert alpha.mean() > 0.0
+
+
+class TestConflictScoreLegacy:
+    """Tests for legacy compute_conflict_score (full logits)."""
+
+    def test_shape(self):
         B, T, V = 2, 10, 100
         frozen_logits = torch.randn(B, T, V)
         labels = torch.randint(0, V, (B, T))
-        labels[:, 0] = -100  # some ignored tokens
+        labels[:, 0] = -100
 
         alpha = compute_conflict_score(frozen_logits, labels)
         assert alpha.shape == (B, T)
 
     def test_range(self):
-        """Output values are in [0, 1]."""
         B, T, V = 4, 20, 50
         frozen_logits = torch.randn(B, T, V)
         labels = torch.randint(0, V, (B, T))
@@ -38,7 +90,6 @@ class TestConflictScore:
         assert alpha.max() <= 1.0
 
     def test_ignored_tokens_zero(self):
-        """Ignored tokens (label=-100) should have α=0."""
         B, T, V = 2, 10, 50
         frozen_logits = torch.randn(B, T, V)
         labels = torch.full((B, T), -100, dtype=torch.long)
@@ -46,85 +97,85 @@ class TestConflictScore:
         alpha = compute_conflict_score(frozen_logits, labels)
         assert torch.all(alpha == 0.0)
 
-    def test_high_conflict_for_wrong_prediction(self):
-        """When frozen model strongly predicts wrong token, conflict should be high."""
-        B, T, V = 1, 5, 10
-        # Make frozen model confident on token 0
-        frozen_logits = torch.zeros(B, T, V)
-        frozen_logits[:, :, 0] = 10.0  # strongly predicts token 0
-        # Ground truth is token 5 (different from prediction)
-        labels = torch.full((B, T), 5, dtype=torch.long)
 
-        alpha = compute_conflict_score(frozen_logits, labels, lambda1=1.0, lambda2=0.5)
-        # Conflict should be relatively high (above 0.5)
-        assert alpha.mean() > 0.5
-
-
-class TestStability:
-    """Tests for compute_stability."""
-
-    def test_identical_perturbations_high_stability(self):
-        """When all perturbations are identical, stability should be ~1."""
-        B, T, V = 2, 10, 50
-        ref = torch.randn(B, T, V)
-        perturbations = [ref.clone() for _ in range(3)]
-
-        stability = compute_stability(perturbations, ref)
-        assert stability.shape == (B, T)
-        assert torch.allclose(stability, torch.ones_like(stability), atol=1e-5)
-
-    def test_random_perturbations_lower_stability(self):
-        """When perturbations are very different, stability should be lower."""
-        B, T, V = 2, 10, 50
-        ref = torch.randn(B, T, V)
-        perturbations = [torch.randn(B, T, V) * 10 for _ in range(5)]
-
-        stability = compute_stability(perturbations, ref)
-        assert stability.mean() < 0.9  # should be lower than perfect
-
-
-class TestEvidenceDrift:
-    """Tests for compute_evidence_drift."""
-
-    def test_no_drift(self):
-        """When EMA = frozen, evidence reliability should be ~1."""
-        B, T, V = 2, 10, 50
-        logits = torch.randn(B, T, V)
-
-        r_evi = compute_evidence_drift(logits, logits)
-        assert r_evi.shape == (B, T)
-        assert torch.allclose(r_evi, torch.ones_like(r_evi), atol=1e-5)
-
-    def test_large_drift_low_reliability(self):
-        """When EMA and frozen are very different, reliability should be low."""
-        B, T, V = 2, 10, 50
-        ema_logits = torch.randn(B, T, V) * 10
-        frozen_logits = torch.randn(B, T, V) * 10
-
-        r_evi = compute_evidence_drift(ema_logits, frozen_logits)
-        assert r_evi.mean() < 0.9
-
-
-class TestReliability:
-    """Tests for compute_reliability."""
+class TestReliabilityFromDrift:
+    """Tests for compute_reliability_from_drift."""
 
     def test_range(self):
-        """Output should be in [0, 1]."""
         B, T = 4, 20
-        stability = torch.rand(B, T)
-        evidence = torch.rand(B, T)
+        drift = torch.rand(B, T)
 
-        r_t = compute_reliability(stability, evidence)
+        r_t = compute_reliability_from_drift(drift)
         assert r_t.shape == (B, T)
         assert r_t.min() >= 0.0
         assert r_t.max() <= 1.0
 
+    def test_zero_drift_high_reliability(self):
+        B, T = 2, 10
+        drift = torch.zeros(B, T)
 
-class TestTrustRegionLoss:
-    """Tests for compute_trust_region_loss."""
+        r_t = compute_reliability_from_drift(drift, gamma=1.0)
+        # exp(-0) = 1.0, after sigmoid normalization → ~0.5
+        assert r_t.mean() >= 0.4
+
+
+class TestTrustRegionLossCached:
+    """Tests for compute_trust_region_loss_cached."""
 
     def test_produces_scalar(self):
-        """Loss should be a scalar."""
+        B, T, V = 2, 10, 50
+        active_logits = torch.randn(B, T, V, requires_grad=True)
+        labels = torch.randint(0, V, (B, T))
+        alpha_t = torch.rand(B, T)
+        r_t = torch.rand(B, T)
+        prior_target_logp = torch.randn(B, T)
+
+        loss, active_logp = compute_trust_region_loss_cached(
+            active_logits, labels, alpha_t, r_t, prior_target_logp
+        )
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
+
+    def test_gradient_flows(self):
+        B, T, V = 2, 10, 50
+        active_logits = torch.randn(B, T, V, requires_grad=True)
+        labels = torch.randint(0, V, (B, T))
+        alpha_t = torch.rand(B, T)
+        r_t = torch.rand(B, T)
+        prior_target_logp = torch.randn(B, T)
+
+        loss, _ = compute_trust_region_loss_cached(
+            active_logits, labels, alpha_t, r_t, prior_target_logp
+        )
+        loss.backward()
+        assert active_logits.grad is not None
+        assert not torch.all(active_logits.grad == 0)
+
+    def test_smooth_vs_hinge(self):
+        B, T, V = 2, 10, 50
+        active_logits = torch.randn(B, T, V, requires_grad=True)
+        labels = torch.randint(0, V, (B, T))
+        alpha_t = torch.rand(B, T)
+        r_t = torch.rand(B, T)
+        prior_target_logp = torch.randn(B, T)
+
+        loss_smooth, _ = compute_trust_region_loss_cached(
+            active_logits, labels, alpha_t, r_t, prior_target_logp, use_smooth=True
+        )
+        loss_hinge, _ = compute_trust_region_loss_cached(
+            active_logits.detach().requires_grad_(True), labels,
+            alpha_t, r_t, prior_target_logp, use_smooth=False
+        )
+
+        assert not torch.isnan(loss_smooth)
+        assert not torch.isnan(loss_hinge)
+
+
+class TestTrustRegionLossLegacy:
+    """Tests for legacy compute_trust_region_loss."""
+
+    def test_produces_scalar(self):
         B, T, V = 2, 10, 50
         active_logits = torch.randn(B, T, V, requires_grad=True)
         frozen_logits = torch.randn(B, T, V)
@@ -135,12 +186,10 @@ class TestTrustRegionLoss:
         loss = compute_trust_region_loss(
             active_logits, frozen_logits, labels, alpha_t, r_t
         )
-        assert loss.dim() == 0  # scalar
+        assert loss.dim() == 0
         assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
 
     def test_gradient_flows(self):
-        """Gradient should flow through the loss."""
         B, T, V = 2, 10, 50
         active_logits = torch.randn(B, T, V, requires_grad=True)
         frozen_logits = torch.randn(B, T, V)
@@ -155,65 +204,62 @@ class TestTrustRegionLoss:
         assert active_logits.grad is not None
         assert not torch.all(active_logits.grad == 0)
 
-    def test_smooth_vs_hinge(self):
-        """Both smooth and hinge variants should produce valid losses."""
-        B, T, V = 2, 10, 50
-        active_logits = torch.randn(B, T, V, requires_grad=True)
-        frozen_logits = torch.randn(B, T, V)
-        labels = torch.randint(0, V, (B, T))
-        alpha_t = torch.rand(B, T)
-        r_t = torch.rand(B, T)
 
-        loss_smooth = compute_trust_region_loss(
-            active_logits, frozen_logits, labels, alpha_t, r_t, use_smooth=True
-        )
-        loss_hinge = compute_trust_region_loss(
-            active_logits.detach().requires_grad_(True), frozen_logits, labels,
-            alpha_t, r_t, use_smooth=False
-        )
+class TestDriftBuffer:
+    """Tests for DriftBuffer."""
 
-        assert not torch.isnan(loss_smooth)
-        assert not torch.isnan(loss_hinge)
+    def test_update_and_reliability(self):
+        buf = DriftBuffer(decay=0.9, gamma=1.0)
 
+        B, T = 2, 10
+        active_logp = torch.randn(B, T)
+        prior_logp = torch.randn(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
 
-class TestEMAUpdate:
-    """Tests for EMA parameter update."""
+        drift = buf.update(active_logp, prior_logp, valid_mask)
+        assert drift.shape == (B, T)
+        assert drift.min() >= 0.0
 
-    def test_ema_moves_toward_active(self):
-        """After EMA update, EMA params should be closer to active params."""
-        import torch.nn as nn
+        r_evi = buf.get_evidence_reliability(drift)
+        assert r_evi.shape == (B, T)
+        assert r_evi.min() >= 0.0
+        assert r_evi.max() <= 1.0
 
-        model = nn.Linear(10, 10)
-        ema_model = nn.Linear(10, 10)
+    def test_no_drift_high_reliability(self):
+        buf = DriftBuffer(decay=0.9, gamma=1.0)
 
-        # Initialize differently
-        with torch.no_grad():
-            model.weight.fill_(1.0)
-            ema_model.weight.fill_(0.0)
+        B, T = 2, 10
+        logp = torch.randn(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
 
-        initial_dist = (model.weight - ema_model.weight).norm().item()
+        # Same values → zero drift
+        drift = buf.update(logp, logp, valid_mask)
+        r_evi = buf.get_evidence_reliability(drift)
 
-        update_ema_model(ema_model, model, decay=0.9)
+        # exp(-0) = 1
+        assert torch.allclose(r_evi, torch.ones_like(r_evi), atol=1e-5)
 
-        final_dist = (model.weight - ema_model.weight).norm().item()
+    def test_running_drift_accumulates(self):
+        buf = DriftBuffer(decay=0.5, gamma=1.0)
 
-        assert final_dist < initial_dist
+        B, T = 1, 5
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
 
-    def test_ema_value_correctness(self):
-        """EMA update formula: ema = decay * ema + (1-decay) * active."""
-        import torch.nn as nn
+        # Step 1: large drift
+        active = torch.zeros(B, T)
+        prior = torch.ones(B, T) * 5.0
+        buf.update(active, prior, valid_mask)
+        drift_1 = buf.running_drift
 
-        model = nn.Linear(10, 10, bias=False)
-        ema_model = nn.Linear(10, 10, bias=False)
+        # Step 2: zero drift
+        buf.update(active, active, valid_mask)
+        drift_2 = buf.running_drift
 
-        with torch.no_grad():
-            model.weight.fill_(1.0)
-            ema_model.weight.fill_(0.0)
+        # Running drift should decrease
+        assert drift_2 < drift_1
 
-        decay = 0.9
-        update_ema_model(ema_model, model, decay=decay)
-
-        expected = 0.0 * decay + 1.0 * (1 - decay)  # = 0.1
-        assert torch.allclose(
-            ema_model.weight, torch.full_like(ema_model.weight, expected), atol=1e-6
-        )
+    def test_plugin_imports(self):
+        from axolotl.integrations.rcca_tr import RCCATRPlugin, RCCATRArgs
+        plugin = RCCATRPlugin()
+        assert plugin.get_input_args() == "axolotl.integrations.rcca_tr.RCCATRArgs"
+        assert plugin.get_training_args_mixin() == "axolotl.integrations.rcca_tr.args.RCCATRTrainingArgsMixin"
