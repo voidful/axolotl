@@ -11,8 +11,9 @@ liger_glu_activation: true
 
 # Dataset
 datasets:
-  - path: voidful/gemini-3.1-opus-4.6-reasoning-merged
+  - path: voidful/earica_text_train
     type: chat_template
+    field_messages: conversations
     split: train
 
 dataset_prepared_path: ./prepared_data/baseline
@@ -45,7 +46,7 @@ save_strategy: epoch
 
 output_dir: ./outputs/baseline-fft
 
-hub_model_id: voidful/Qwen3.5-9B-gemini-3.1-opus-4.6-reasoning-fft-baseline
+hub_model_id: voidful/Qwen3.5-9B-earica-fft-baseline
 push_to_hub: true
 hub_strategy: end
 
