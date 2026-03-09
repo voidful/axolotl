@@ -43,8 +43,6 @@ datasets:
     type: chat_template
     field_messages: conversations
     split: train
-dataset_prepared_path: ./prepared_data/rcca_tr
-
 chat_template: minimax
 
 # Training settings

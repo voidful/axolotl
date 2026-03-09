@@ -60,6 +60,7 @@ class ChatTemplate(str, Enum):
     qwen_25 = "qwen_25"
     qwen3 = "qwen3"
     qwen3_5 = "qwen3_5"
+    minimax = "minimax"
     falcon_h1 = "falcon_h1"
     tokenizer_default = "tokenizer_default"
     exaone = "exaone"

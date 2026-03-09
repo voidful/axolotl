@@ -592,6 +592,10 @@ def get_processing_strategy(
         return Qwen3_5ProcessingStrategy(
             **processing_kwargs,
         )
+    if chat_template_type == "minimax":
+        return ProcessingStrategy(
+            **processing_kwargs,
+        )
     if chat_template_type == "gemma3":
         return Gemma3ProcessingStrategy(
             **processing_kwargs,
