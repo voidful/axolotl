@@ -3,6 +3,7 @@
 # Prior = offline cache, EMA = drift buffer
 
 base_model: MiniMaxAI/MiniMax-M2.5
+low_cpu_mem_usage: true
 
 plugins:
   - axolotl.integrations.rcca_tr.RCCATRPlugin
@@ -42,10 +43,9 @@ datasets:
     type: chat_template
     field_messages: conversations
     split: train
-
 dataset_prepared_path: ./prepared_data/rcca_tr
 
-chat_template: qwen3_5
+chat_template: minimax
 
 # Training settings
 sequence_len: 16384
