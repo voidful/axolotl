@@ -2,7 +2,7 @@
 # A+ variant: only 1 model in GPU memory (active model)
 # Prior = offline cache, EMA = drift buffer
 
-base_model: Qwen/Qwen3.5-9B
+base_model: MiniMaxAI/MiniMax-M2.5
 
 plugins:
   - axolotl.integrations.rcca_tr.RCCATRPlugin
@@ -65,7 +65,7 @@ flash_attention: true
 
 dataloader_num_workers: 0
 
-deepspeed: deepspeed_configs/zero2.json
+deepspeed: deepspeed_configs/zero3_custom.json
 
 val_set_size: 0.05
 
@@ -73,7 +73,7 @@ save_strategy: epoch
 
 output_dir: ./outputs/rcca-tr-fft
 
-hub_model_id: voidful/Qwen3.5-9B-earica
+hub_model_id: voidful/MiniMax-M2.5-earica
 push_to_hub: true
 hub_strategy: end
 
