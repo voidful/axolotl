@@ -2,7 +2,7 @@
 # A+ variant: only 1 model in GPU memory (active model)
 # Prior = offline cache, EMA = drift buffer
 
-base_model: MiniMaxAI/MiniMax-M2.5
+base_model: Qwen/Qwen3.5-27B
 low_cpu_mem_usage: true
 
 plugins:
@@ -43,7 +43,8 @@ datasets:
     type: chat_template
     field_messages: conversations
     split: train
-chat_template: minimax
+
+chat_template: qwen3_5
 
 # Training settings
 sequence_len: 16384
@@ -71,7 +72,7 @@ save_strategy: epoch
 
 output_dir: ./outputs/rcca-tr-fft
 
-hub_model_id: voidful/MiniMax-M2.5-earica
+hub_model_id: voidful/Qwen3.5-27B-earica
 push_to_hub: true
 hub_strategy: end
 
