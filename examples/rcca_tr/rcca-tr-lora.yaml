@@ -2,7 +2,7 @@
 # A+ variant: only 1 model in GPU memory (active model)
 # Prior = offline cache, EMA = drift buffer
 
-base_model: QQwen/Qwen3.5-35B-A3B
+base_model: Qwen/Qwen3.5-35B-A3B
 low_cpu_mem_usage: true
 
 plugins:
