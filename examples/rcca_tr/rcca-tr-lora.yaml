@@ -2,7 +2,7 @@
 # A+ variant: only 1 model in GPU memory (active model)
 # Prior = offline cache, EMA = drift buffer
 
-base_model: Qwen/Qwen3.5-27B
+base_model: QQwen/Qwen3.5-35B-A3B
 low_cpu_mem_usage: true
 
 plugins:
@@ -72,7 +72,7 @@ save_strategy: epoch
 
 output_dir: ./outputs/rcca-tr-fft
 
-hub_model_id: voidful/Qwen3.5-27B-earica
+hub_model_id: voidful/Qwen3.5-35B-A3B-earica
 push_to_hub: true
 hub_strategy: end
 
