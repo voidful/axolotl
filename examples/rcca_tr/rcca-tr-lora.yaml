@@ -44,7 +44,7 @@ datasets:
     field_messages: conversations
     split: train
 
-chat_template: gpt_oss
+chat_template: chatml
 
 # Training settings
 sequence_len: 16384
