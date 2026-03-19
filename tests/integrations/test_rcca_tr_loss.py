@@ -258,6 +258,51 @@ class TestDriftBuffer:
         # Running drift should decrease
         assert drift_2 < drift_1
 
+    def test_get_current_drift_does_not_update(self):
+        buf = DriftBuffer(decay=0.5, gamma=1.0)
+
+        B, T = 1, 5
+        active = torch.zeros(B, T)
+        prior = torch.ones(B, T) * 5.0
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+        drift_before = buf.running_drift
+        _ = buf.get_current_drift(active, prior, valid_mask)
+        drift_after = buf.running_drift
+
+        # get_current_drift should NOT update running drift
+        assert drift_before == drift_after
+
+    def test_step_updates_running_drift(self):
+        buf = DriftBuffer(decay=0.5, gamma=1.0)
+
+        B, T = 1, 5
+        active = torch.zeros(B, T)
+        prior = torch.ones(B, T) * 5.0
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+        assert buf.running_drift == 0.0
+        buf.step(active, prior, valid_mask)
+        assert buf.running_drift > 0.0
+
+    def test_split_api_matches_update(self):
+        """get_current_drift + step should produce same results as update."""
+        buf_split = DriftBuffer(decay=0.9, gamma=1.0)
+        buf_combined = DriftBuffer(decay=0.9, gamma=1.0)
+
+        B, T = 2, 10
+        active = torch.randn(B, T)
+        prior = torch.randn(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+        drift_split = buf_split.get_current_drift(active, prior, valid_mask)
+        buf_split.step(active, prior, valid_mask)
+
+        drift_combined = buf_combined.update(active, prior, valid_mask)
+
+        assert torch.allclose(drift_split, drift_combined, atol=1e-6)
+        assert abs(buf_split.running_drift - buf_combined.running_drift) < 1e-6
+
     def test_plugin_imports(self):
         from axolotl.integrations.rcca_tr import RCCATRPlugin, RCCATRArgs
         plugin = RCCATRPlugin()

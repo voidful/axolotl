@@ -50,19 +50,18 @@ class DriftBuffer:
         self.gamma = gamma
         self._running_drift = 0.0  # scalar running average
 
-    def update(
+    def get_current_drift(
         self,
         active_target_logp: torch.Tensor,
         prior_target_logp: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Update drift buffer and return current per-token drift values.
+        Compute per-token drift using the current running average (without updating it).
 
         drift_t = |log p_θ(y_t) - log p_0(y_t)|
 
-        The running average is updated as:
-            d = decay * d + (1 - decay) * mean(drift_t)
+        Returns blended drift: 0.5 * instant + 0.5 * running_average.
 
         Args:
             active_target_logp: log p_θ(y_t), shape (B, T).
@@ -70,12 +69,32 @@ class DriftBuffer:
             valid_mask: Boolean mask for valid tokens, shape (B, T).
 
         Returns:
-            Per-token drift values (broadcast from running average), shape (B, T).
+            Per-token drift values, shape (B, T).
         """
-        # Compute instantaneous per-token drift
-        instant_drift = (active_target_logp - prior_target_logp).abs()  # (B, T)
+        instant_drift = (active_target_logp - prior_target_logp).abs()
+        blended_drift = (
+            0.5 * instant_drift
+            + 0.5 * self._running_drift
+        )
+        return blended_drift * valid_mask.float()
 
-        # Update running average with mean of valid tokens
+    def step(
+        self,
+        active_target_logp: torch.Tensor,
+        prior_target_logp: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ):
+        """
+        Update the running drift average with the current batch's mean drift.
+
+        d = decay * d + (1 - decay) * mean(|log p_θ(y_t) - log p_0(y_t)|)
+
+        Args:
+            active_target_logp: log p_θ(y_t), shape (B, T).
+            prior_target_logp: log p_0(y_t), shape (B, T).
+            valid_mask: Boolean mask for valid tokens, shape (B, T).
+        """
+        instant_drift = (active_target_logp - prior_target_logp).abs()
         if valid_mask.any():
             batch_mean_drift = instant_drift[valid_mask].mean().item()
         else:
@@ -86,14 +105,28 @@ class DriftBuffer:
             + (1.0 - self.decay) * batch_mean_drift
         )
 
-        # Return per-token drift (use instant for per-token granularity,
-        # blended with running average for stability)
-        blended_drift = (
-            0.5 * instant_drift
-            + 0.5 * self._running_drift
-        )
+    def update(
+        self,
+        active_target_logp: torch.Tensor,
+        prior_target_logp: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Update drift buffer and return current per-token drift values.
 
-        return blended_drift * valid_mask.float()
+        Convenience method that calls get_current_drift() then step().
+
+        Args:
+            active_target_logp: log p_θ(y_t), shape (B, T).
+            prior_target_logp: log p_0(y_t), shape (B, T).
+            valid_mask: Boolean mask for valid tokens, shape (B, T).
+
+        Returns:
+            Per-token drift values (blended), shape (B, T).
+        """
+        drift = self.get_current_drift(active_target_logp, prior_target_logp, valid_mask)
+        self.step(active_target_logp, prior_target_logp, valid_mask)
+        return drift
 
     def get_evidence_reliability(self, drift: torch.Tensor) -> torch.Tensor:
         """

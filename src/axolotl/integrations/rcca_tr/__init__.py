@@ -21,9 +21,16 @@ Provides token-wise adaptive trust-region fine-tuning with:
   - Only the active model in GPU memory
 """
 
+import torch
+from transformers import Trainer
+
 from axolotl.integrations.base import BasePlugin
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
 
 from .args import RCCATRArgs as RCCATRArgs
+
+LOG = get_logger(__name__)
 
 
 class RCCATRPlugin(BasePlugin):
@@ -63,3 +70,45 @@ class RCCATRPlugin(BasePlugin):
             "rcca_tr_drift_gamma": cfg.rcca_tr_drift_gamma,
             "rcca_tr_prior_cache_path": cfg.rcca_tr_prior_cache_path,
         }
+
+    def get_collator_cls_and_kwargs(self, cfg, is_eval=False):
+        if not cfg.rcca_tr_trainer:
+            return None, None
+
+        from .collator import DataCollatorForRCCATR
+
+        return DataCollatorForRCCATR, {}
+
+    def post_trainer_create(self, cfg: DictDefault, trainer: Trainer):
+        cache_path = getattr(cfg, "rcca_tr_prior_cache_path", None)
+        if not cache_path:
+            LOG.info("No prior cache path specified. Prior values will be zeros.")
+            return
+
+        LOG.info("Loading prior cache from %s", cache_path)
+        cache = torch.load(cache_path, weights_only=True)
+        num_cache_samples = len(cache["prior_target_logp"])
+        LOG.info("Prior cache loaded: %d samples", num_cache_samples)
+
+        def inject_prior(example, idx):
+            seq_len = len(example["input_ids"])
+            if idx < num_cache_samples:
+                cached_logp = cache["prior_target_logp"][idx]
+                cached_margin = cache["prior_margin"][idx]
+                logp_list = cached_logp[:seq_len].tolist()
+                margin_list = cached_margin[:seq_len].tolist()
+                # Pad if cache sequence is shorter than tokenized sequence
+                if len(logp_list) < seq_len:
+                    logp_list += [0.0] * (seq_len - len(logp_list))
+                    margin_list += [0.0] * (seq_len - len(margin_list))
+                example["prior_target_logp"] = logp_list
+                example["prior_margin"] = margin_list
+            else:
+                example["prior_target_logp"] = [0.0] * seq_len
+                example["prior_margin"] = [0.0] * seq_len
+            return example
+
+        trainer.train_dataset = trainer.train_dataset.map(
+            inject_prior, with_indices=True
+        )
+        LOG.info("Prior cache values injected into training dataset.")

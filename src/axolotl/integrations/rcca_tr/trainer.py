@@ -56,22 +56,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         LOG.info("Initializing RCCA-TR A+ trainer...")
 
-        # Load prior cache if path is specified
-        prior_cache_path = getattr(self.args, "rcca_tr_prior_cache_path", None)
-        if prior_cache_path:
-            LOG.info("Loading prior cache from %s", prior_cache_path)
-            self._prior_cache = torch.load(prior_cache_path, weights_only=True)
-            LOG.info(
-                "Prior cache loaded: %d samples",
-                len(self._prior_cache["prior_target_logp"]),
-            )
-        else:
-            self._prior_cache = None
-            LOG.info(
-                "No prior cache path specified. "
-                "Will run frozen forward pass on-the-fly (fallback mode)."
-            )
-
         # Initialize drift buffer (replaces EMA model)
         ema_decay = getattr(self.args, "rcca_tr_ema_decay", 0.999) or 0.999
         drift_gamma = getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0
@@ -83,35 +67,12 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             drift_gamma,
         )
 
-    def _get_prior_values_from_cache(
-        self, batch_idx: int | None, labels: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get prior_target_logp and prior_margin for the current batch.
-
-        If a prior cache file is loaded, look up cached values.
-        Otherwise return zeros (fallback — conflict score becomes uniform).
-
-        Returns:
-            (prior_target_logp, prior_margin), each shape (B, T).
-        """
-        B, T = labels.shape
-        device = labels.device
-
-        if self._prior_cache is None:
-            # Fallback: uniform conflict, no drift
-            return (
-                torch.zeros(B, T, device=device),
-                torch.zeros(B, T, device=device),
-            )
-
-        # For now, return zeros as placeholder — actual cache indexing
-        # depends on how axolotl's dataloader provides sample IDs.
-        # The preprocessing pipeline will embed these into the dataset.
-        return (
-            torch.zeros(B, T, device=device),
-            torch.zeros(B, T, device=device),
-        )
+    def _set_signature_columns_if_needed(self):
+        super()._set_signature_columns_if_needed()
+        if self._signature_columns:
+            for col in ["prior_target_logp", "prior_margin"]:
+                if col not in self._signature_columns:
+                    self._signature_columns.append(col)
 
     @override
     def compute_loss(
@@ -138,6 +99,10 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         if num_items_in_batch is None and "labels" in inputs:
             num_items_in_batch = (inputs["labels"] != -100).sum().item()
 
+        # Pop RCCA-TR fields before model forward (model doesn't accept them)
+        prior_target_logp = inputs.pop("prior_target_logp", None)
+        prior_margin = inputs.pop("prior_margin", None)
+
         # Forward pass through active model
         outputs = model(**inputs)
 
@@ -156,18 +121,12 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         B, T = labels.shape
         valid_mask = labels != -100
 
-        # 2. Get cached prior values
-        # Check if prior values are embedded in the batch (from preprocessing)
-        if "prior_target_logp" in inputs and "prior_margin" in inputs:
-            prior_target_logp = inputs["prior_target_logp"]  # (B, T)
-            prior_margin = inputs["prior_margin"]  # (B, T)
-        else:
-            # Fallback: compute on-the-fly if no cache available
-            prior_target_logp, prior_margin = self._get_prior_values_from_cache(
-                None, labels
-            )
+        # Fallback: zeros if prior values not in batch
+        if prior_target_logp is None or prior_margin is None:
+            prior_target_logp = torch.zeros(B, T, device=labels.device)
+            prior_margin = torch.zeros(B, T, device=labels.device)
 
-        # 3. Compute conflict score α_t from cached values
+        # 1. Compute conflict score α_t from cached values
         alpha_t = compute_conflict_score_from_cache(
             prior_target_logp=prior_target_logp,
             prior_margin=prior_margin,
@@ -177,8 +136,8 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             tau=getattr(self.args, "rcca_tr_conflict_tau", 1.0) or 1.0,
         )
 
-        # 4. Compute drift and reliability (no EMA model needed)
-        # Get active model's log p(y_t) for drift computation
+        # 2. Compute drift-based reliability using previous running average
+        # Get active model's log p(y_t) for drift estimation
         with torch.no_grad():
             active_log_probs = F.log_softmax(active_logits, dim=-1)
             safe_labels = labels.clamp(min=0)
@@ -187,21 +146,19 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             ).squeeze(-1)  # (B, T)
             active_target_logp = active_target_logp * valid_mask.float()
 
-        # Update drift buffer and get drift values
-        drift = self.drift_buffer.update(
+        drift = self.drift_buffer.get_current_drift(
             active_target_logp=active_target_logp,
             prior_target_logp=prior_target_logp,
             valid_mask=valid_mask,
         )
 
-        # Compute reliability from drift
         r_t = compute_reliability_from_drift(
             drift=drift,
             gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
             tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
         )
 
-        # 5. Compute trust-region loss with KL proxy
+        # 3. Compute trust-region loss with KL proxy
         loss, _ = compute_trust_region_loss_cached(
             active_logits=active_logits,
             labels=labels,
@@ -213,6 +170,13 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             epsilon_max=getattr(self.args, "rcca_tr_epsilon_max", 1.0) or 1.0,
             use_smooth=getattr(self.args, "rcca_tr_use_smooth_objective", True),
             num_items_in_batch=num_items_in_batch,
+        )
+
+        # 4. Update drift buffer with this step's values
+        self.drift_buffer.step(
+            active_target_logp=active_target_logp,
+            prior_target_logp=prior_target_logp,
+            valid_mask=valid_mask,
         )
 
         return (loss, outputs) if return_outputs else loss
