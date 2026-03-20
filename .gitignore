@@ -199,3 +199,7 @@ examples/rcca_tr/run_slurm_27b.sh
 .gitignore
 .gitignore
 examples/rcca_tr/run_slurm_35b.sh
+examples/rcca_tr/run_slurm_27b copy.sh
+examples/rcca_tr/run_slurm_35b copy.sh
+examples/rcca_tr/run_slurm_35b_dt.sh
+examples/rcca_tr/run_slurm_27b_dt.sh

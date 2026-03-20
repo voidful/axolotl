@@ -1,0 +1,163 @@
+base_model: voidful/Qwen3.5-27B-earica
+low_cpu_mem_usage: true
+
+plugins:
+  - axolotl.integrations.rcca_tr.RCCATRPlugin
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+rcca_tr_trainer: true
+rcca_tr_conflict_lambda1: 1.0
+rcca_tr_conflict_lambda2: 0.5
+rcca_tr_conflict_tau: 1.0
+rcca_tr_reliability_beta: 0.5
+rcca_tr_reliability_tau: 1.0
+rcca_tr_epsilon_min: 0.01
+rcca_tr_epsilon_max: 1.0
+rcca_tr_kl_lambda: 1.0
+rcca_tr_use_smooth_objective: true
+rcca_tr_ema_decay: 0.999
+rcca_tr_drift_gamma: 1.0
+
+datasets:
+  - path: voidful/gemini-3.1-opus-4.6-reasoning-merged_v2
+    type: chat_template
+    split: train
+
+dataset_prepared_path: ./prepared_data/rcca_tr_27b
+
+
+chat_template: jinja
+chat_template_jinja: >-
+  {%- if tools %}
+      {{- '<|im_start|>system\n' }}
+      {%- if messages[0].role == 'system' %}
+          {{- messages[0].content + '\n\n' }}
+      {%- endif %}
+      {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+      {%- for tool in tools %}
+          {{- "\n" ~ tool | tojson }}
+      {%- endfor %}
+      {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+  {%- else %}
+      {%- if messages[0].role == 'system' %}
+          {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+      {%- endif %}
+  {%- endif %}
+  {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+  {%- if real_last_index is defined and real_last_index is not none %}
+      {%- set ns.real_last_index = real_last_index %}
+  {%- else %}
+      {%- set ns.real_last_index = messages|length - 1 %}
+  {%- endif %}
+  {%- for message in messages[::-1] %}
+      {%- set index = (messages|length - 1) - loop.index0 %}
+      {%- if message['content'] is string %}
+          {%- if ns.multi_step_tool and message.role == "user" and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+              {%- set ns.multi_step_tool = false %}
+              {%- set ns.last_query_index = index %}
+          {%- endif %}
+      {%- else %}
+          {%- if ns.multi_step_tool and message.role == "user" %}
+              {%- set ns.multi_step_tool = false %}
+              {%- set ns.last_query_index = index %}
+          {%- endif %}
+      {%- endif %}
+  {%- endfor %}
+  {%- for message in messages %}
+      {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+          {{- '<|im_start|>' + message.role + '\n' }}
+          {%- if message['content'] is string %}
+              {{- message.content }}
+          {%- else %}
+              {%- for content in message['content'] %}
+                  {%- if content['type'] == 'image' or 'image' in content or 'image_url' in content %}
+                      {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+                  {%- elif content['type'] == 'video' or 'video' in content %}
+                      {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+                  {%- elif 'text' in content %}
+                      {{- content['text'] }}
+                  {%- endif %}
+              {%- endfor %}
+          {%- endif %}
+          {{- '<|im_end|>\n' }}
+      {%- elif message.role == "assistant" %}
+          {%- set content = '' %}
+          {%- if message['content'] is string %}
+              {%- set content = message.content %}
+          {%- else %}
+              {%- for item in message['content'] %}
+                  {%- if 'text' in item %}{%- set content = content + item['text'] %}{%- endif %}
+              {%- endfor %}
+          {%- endif %}
+          {%- set reasoning_content = '' %}
+          {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+              {%- set reasoning_content = message.reasoning_content %}
+          {%- elif '</think>' in content %}
+              {%- set temp_content = content %}
+              {%- set reasoning_content = temp_content.split('</think>')[0].split('<think>')[-1].strip('\n') %}
+              {%- set content = temp_content.split('</think>')[-1].lstrip('\n') %}
+          {%- endif %}
+          {%- if loop.index0 > ns.last_query_index %}
+              {%- if loop.index0 == ns.real_last_index or (loop.index0 != ns.real_last_index and reasoning_content) %}
+                  {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+              {%- else %}
+                  {{- '<|im_start|>' + message.role + '\n' + content }}
+              {%- endif %}
+          {%- else %}
+              {{- '<|im_start|>' + message.role + '\n' + content }}
+          {%- endif %}
+          {%- if message.tool_calls %}
+              {%- for tool_call in message.tool_calls %}
+                  {%- if (loop.first and content) or (not loop.first) %}{{- '\n' }}{%- endif %}
+                  {%- if tool_call.function %}{%- set tool_call = tool_call.function %}{%- endif %}
+                  {{- '<tool_call>\n{"name": "' + tool_call.name + '", "arguments": ' }}
+                  {%- if tool_call.arguments is string %}{{- tool_call.arguments }}{%- else %}{{- tool_call.arguments | tojson }}{%- endif %}
+                  {{- '}\n</tool_call>' }}
+              {%- endfor %}
+          {%- endif %}
+          {{- '<|im_end|>\n' }}
+      {%- elif message.role == "tool" %}
+          {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}{{- '<|im_start|>user' }}{%- endif %}
+          {{- '\n<tool_response>\n' + message.content + '\n</tool_response>' }}
+          {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}{{- '<|im_end|>\n' }}{%- endif %}
+      {%- endif %}
+  {%- endfor %}
+  {%- if add_generation_prompt %}
+      {{- '<|im_start|>assistant\n<think>\n' }}
+      {%- if enable_thinking is defined and enable_thinking is false %}
+          {{- '</think>\n\n' }}
+      {%- else %}
+          {{- '<range>' }}
+      {%- endif %}
+  {%- endif %}
+
+sequence_len: 16384
+sample_packing: true
+pad_to_sequence_len: true
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+num_epochs: 3
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2e-5
+
+bf16: true
+gradient_checkpointing: true
+flash_attention: true
+dataloader_num_workers: 0
+val_set_size: 0.05
+save_strategy: epoch
+output_dir: ./outputs/rcca-tr-fft
+
+deepspeed: deepspeed_configs/zero3_custom.json
+
+hub_model_id: voidful/Qwen3.5-27B-gemini-3.1-opus-4.6-reasoning
+push_to_hub: true
+hub_strategy: end
+
+log_on_each_node: false
+logging_steps: 1
