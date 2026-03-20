@@ -52,6 +52,26 @@ class DataCollatorForRCCATR(DataCollatorForSeq2Seq):
         self.tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
     def __call__(self, features, return_tensors=None):
+        if isinstance(features[0], list):
+            out_features = [{} for _ in features]
+            for i, features_ in enumerate(features):
+                for feature in features_[0].keys():
+                    if feature == "length":
+                        continue
+                    if feature == "attention_mask":
+                        arrays = [
+                            (j + 1) * np.array(item[feature])
+                            for j, item in enumerate(features_)
+                            if feature in item
+                        ]
+                        out_features[i][feature] = np.concatenate(arrays)
+                    else:
+                        arrays = [
+                            np.array(item[feature]) for item in features_ if feature in item
+                        ]
+                        out_features[i][feature] = np.concatenate(arrays)
+            features = out_features
+
         if return_tensors is None:
             return_tensors = self.return_tensors
 
