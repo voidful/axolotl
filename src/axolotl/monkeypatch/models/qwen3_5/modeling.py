@@ -21,27 +21,25 @@ except ImportError:
         fla_causal_conv1d = None
 
 
-def get_cu_seqlens(position_ids):
+def get_cu_seqlens(position_ids, attention_mask=None):
     """
     Compute cumulative sequence lengths from position_ids for FLA varlen kernels.
-
-    Adapted from transformers.modeling_flash_attention_utils.prepare_fa_kwargs_from_position_ids.
-    https://github.com/huggingface/transformers/blob/0f1b128d3359a26bd18be99c26d7f04fb3cba914/src/transformers/modeling_flash_attention_utils.py#L316
-
-    Qwen3.5 uses MRoPE: position_ids arrive as [axes, B, T]. All axes carry the
-    same temporal positions, so axis 0 is used to recover the [B, T] layout.
-    See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py
     """
     if position_ids.ndim == 3:
         position_ids = position_ids[0]
 
     tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
     position_ids = position_ids.view(-1)
-    indices_q = (position_ids == 0).nonzero().view(-1)
+    
+    is_start = (position_ids == 0)
+    if attention_mask is not None:
+        is_start = is_start & (attention_mask.view(-1) != 0)
+        
+    indices_q = is_start.nonzero().view(-1)
     return torch.cat(
         (
             indices_q.to(**tensor_kwargs),
-            torch.tensor(position_ids.size(), **tensor_kwargs),
+            torch.tensor([position_ids.shape[0]], **tensor_kwargs),
         )
     )
 
@@ -134,7 +132,7 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
 
         cu_seqlens = None
         if not use_precomputed_states and position_ids is not None:
-            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
+            cu_seqlens = get_cu_seqlens(position_ids=position_ids, attention_mask=attention_mask)
 
         if cache_params is not None:
             conv_state = cache_params.conv_states[self.layer_idx]
