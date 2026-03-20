@@ -200,6 +200,15 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
+            # [Strategy 1: Dynamic Projection]
+            # Ensure query and key dim is exactly 64 by applying an average pooling projection.
+            # This cleanly satisfies the kernel constraint without changing number of parameters.
+            q_dim = query.shape[-1]
+            if q_dim != 64 and q_dim % 64 == 0:
+                scale = q_dim // 64
+                query = query.view(*query.shape[:-1], 64, scale).mean(dim=-1)
+                key = key.view(*key.shape[:-1], 64, scale).mean(dim=-1)
+
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query,
                 key,
@@ -213,6 +222,12 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
                 **({"cu_seqlens": cu_seqlens} if cu_seqlens is not None else {}),
             )
         else:
+            q_dim = query.shape[-1]
+            if q_dim != 64 and q_dim % 64 == 0:
+                scale = q_dim // 64
+                query = query.view(*query.shape[:-1], 64, scale).mean(dim=-1)
+                key = key.view(*key.shape[:-1], 64, scale).mean(dim=-1)
+
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
                 key,
