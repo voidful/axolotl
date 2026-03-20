@@ -154,6 +154,7 @@ val_set_size: 0.05
 save_strategy: epoch
 output_dir: ./outputs/rcca-tr-fft
 
+deepspeed: deepspeed_configs/zero3_custom.json
 
 hub_model_id: voidful/Qwen3.5-35B-A3B-earica
 push_to_hub: true
