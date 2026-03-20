@@ -24,6 +24,13 @@ except ImportError:
 def get_cu_seqlens(position_ids, attention_mask=None):
     """
     Compute cumulative sequence lengths from position_ids for FLA varlen kernels.
+
+    Adapted from transformers.modeling_flash_attention_utils.prepare_fa_kwargs_from_position_ids.
+    https://github.com/huggingface/transformers/blob/0f1b128d3359a26bd18be99c26d7f04fb3cba914/src/transformers/modeling_flash_attention_utils.py#L316
+
+    Qwen3.5 uses MRoPE: position_ids arrive as [axes, B, T]. All axes carry the
+    same temporal positions, so axis 0 is used to recover the [B, T] layout.
+    See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py
     """
     if position_ids.ndim == 3:
         position_ids = position_ids[0]
@@ -33,6 +40,7 @@ def get_cu_seqlens(position_ids, attention_mask=None):
     
     is_start = (position_ids == 0)
     if attention_mask is not None:
+        # Ignore padding token position_ids (which default to 0) to avoid 0-length seqs
         is_start = is_start & (attention_mask.view(-1) != 0)
         
     indices_q = is_start.nonzero().view(-1).to(**tensor_kwargs)
@@ -124,7 +132,13 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        hidden_states = apply_mask_fn(hidden_states, attention_mask)
+        # Prevent numerical explosion during packing by normalizing packed attention mask [1, 2, 3...]
+        # down to boolean mask [1, 1, 1...] to prevent apply_mask_fn from multiplying values by >1.
+        if attention_mask is not None:
+            mask_bool = (attention_mask != 0).to(hidden_states.dtype)
+            hidden_states = apply_mask_fn(hidden_states, mask_bool)
+        else:
+            hidden_states = apply_mask_fn(hidden_states, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -202,21 +216,30 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        if not use_precomputed_states:
-            # [Strategy 1: Dynamic Projection]
-            # Ensure query and key dim is exactly 64 by applying an average pooling projection.
-            # This cleanly satisfies the kernel constraint without changing number of parameters.
-            q_dim = query.shape[-1]
-            if q_dim != 64 and q_dim % 64 == 0:
-                scale = q_dim // 64
-                query = query.view(*query.shape[:-1], 64, scale).mean(dim=-1)
-                key = key.view(*key.shape[:-1], 64, scale).mean(dim=-1)
+        # --- Kernel dimensional pooling + memory hardening ---
+        q_dim = query.shape[-1]
+        if q_dim != 64 and q_dim % 64 == 0:
+            scale = q_dim // 64
+            query = query.reshape(*query.shape[:-1], 64, scale).mean(dim=-1)
+            key = key.reshape(*key.shape[:-1], 64, scale).mean(dim=-1)
+            if isinstance(beta, torch.Tensor) and beta.dim() == 4 and beta.shape[-1] == q_dim:
+                beta = beta.reshape(*beta.shape[:-1], 64, scale).mean(dim=-1)
+            if isinstance(g, torch.Tensor) and g.dim() == 4 and g.shape[-1] == q_dim:
+                g = g.reshape(*g.shape[:-1], 64, scale).mean(dim=-1)
 
+        # All tensors passed to the Triton kernel must be perfectly contiguous
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        beta = beta.contiguous()
+        g = g.to(dtype=query.dtype).contiguous()
+
+        if not use_precomputed_states:
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query,
                 key,
                 value,
-                g=g.to(dtype=query.dtype),
+                g=g,
                 beta=beta,
                 initial_state=None,
                 output_final_state=cache_params is not None,
@@ -225,17 +248,11 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
                 **({"cu_seqlens": cu_seqlens} if cu_seqlens is not None else {}),
             )
         else:
-            q_dim = query.shape[-1]
-            if q_dim != 64 and q_dim % 64 == 0:
-                scale = q_dim // 64
-                query = query.view(*query.shape[:-1], 64, scale).mean(dim=-1)
-                key = key.view(*key.shape[:-1], 64, scale).mean(dim=-1)
-
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
                 key,
                 value,
-                g=g.to(dtype=query.dtype),
+                g=g,
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
