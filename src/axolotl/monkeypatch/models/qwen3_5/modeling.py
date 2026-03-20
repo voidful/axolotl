@@ -35,10 +35,15 @@ def get_cu_seqlens(position_ids, attention_mask=None):
     if attention_mask is not None:
         is_start = is_start & (attention_mask.view(-1) != 0)
         
-    indices_q = is_start.nonzero().view(-1)
+    indices_q = is_start.nonzero().view(-1).to(**tensor_kwargs)
+    
+    # Guarantee cu_seqlens always starts at 0 (for sequences split across chunks)
+    if indices_q.numel() == 0 or indices_q[0] != 0:
+        indices_q = torch.cat((torch.tensor([0], **tensor_kwargs), indices_q))
+
     return torch.cat(
         (
-            indices_q.to(**tensor_kwargs),
+            indices_q,
             torch.tensor([position_ids.shape[0]], **tensor_kwargs),
         )
     )
