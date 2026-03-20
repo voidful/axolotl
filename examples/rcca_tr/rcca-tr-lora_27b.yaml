@@ -1,4 +1,4 @@
-base_model: huihui-ai/Huihui-Qwen3.5-27B-abliterated
+base_model: Qwen/Qwen3.5-27B
 low_cpu_mem_usage: true
 
 plugins:
@@ -155,9 +155,8 @@ val_set_size: 0.05
 save_strategy: epoch
 output_dir: ./outputs/rcca-tr-fft
 
-deepspeed: deepspeed_configs/zero2.json
 
-hub_model_id: voidful/Qwen3.5-27B-Uncensored-earica
+hub_model_id: voidful/Qwen3.5-27B-earica
 push_to_hub: true
 hub_strategy: end
 
