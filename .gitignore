@@ -195,3 +195,7 @@ out/
 src/axolotl/_version.py
 examples/rcca_tr/run_slurm.sh
 .claude/
+examples/rcca_tr/run_slurm_27b.sh
+.gitignore
+.gitignore
+examples/rcca_tr/run_slurm_35b.sh
