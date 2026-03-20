@@ -2,7 +2,7 @@
 # A+ variant: only 1 model in GPU memory (active model)
 # Prior = offline cache, EMA = drift buffer
 
-base_model: HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive
+base_model: huihui-ai/Huihui-Qwen3.5-27B-abliterated
 low_cpu_mem_usage: true
 
 plugins:
@@ -43,6 +43,8 @@ datasets:
     type: chat_template
     field_messages: conversations
     split: train
+
+dataset_prepared_path: ./prepared_data/rcca_tr
 
 chat_template: qwen3_5
 
