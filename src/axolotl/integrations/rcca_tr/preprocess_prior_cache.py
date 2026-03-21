@@ -212,8 +212,9 @@ def main():
 
     # Strictly stagger model loading sequentially per local GPU to prevent Virtual Memory (mmap) explosion!
     # By forcing them to load one by one, we keep the peak VM at 54GB instead of 54GB * 8 = 432GB (which crashes).
+    job_id = os.environ.get("SLURM_JOB_ID", "local_run")
     if local_rank > 0:
-        prev_flag = os.path.join(args.base_model, f".loaded_{local_rank-1}")
+        prev_flag = os.path.join(args.base_model, f".loaded_{job_id}_{local_rank-1}")
         print(f"[Rank {rank}] Waiting for local_rank {local_rank-1} to finish loading to save VM...")
         while not os.path.exists(prev_flag):
             import time
@@ -236,7 +237,7 @@ def main():
     gc.collect() # Force garbage collect the mmap file handles to free VM
 
     # Signal next local process that it is safe to load its own copy
-    with open(os.path.join(args.base_model, f".loaded_{local_rank}"), "w") as f:
+    with open(os.path.join(args.base_model, f".loaded_{job_id}_{local_rank}"), "w") as f:
         f.write("loaded")
 
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
