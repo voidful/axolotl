@@ -169,12 +169,18 @@ def main():
         end_idx = min(start_idx + args.batch_size, len(dataset))
         batch_samples = dataset[start_idx:end_idx]
 
+        messages_col = None
+        for col in ["messages", "conversations"]:
+            if col in batch_samples:
+                messages_col = col
+                break
+
         # Tokenize
-        if "messages" in batch_samples:
+        if messages_col:
             # Chat format — apply chat template
             texts = []
-            for i in range(len(batch_samples["messages"])):
-                msgs = batch_samples["messages"][i]
+            for i in range(len(batch_samples[messages_col])):
+                msgs = batch_samples[messages_col][i]
                 text = tokenizer.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False
                 )
@@ -183,7 +189,7 @@ def main():
             texts = batch_samples["text"]
         else:
             raise ValueError(
-                f"Dataset must have 'messages' or 'text' column. "
+                f"Dataset must have 'messages', 'conversations', or 'text' column. "
                 f"Found: {list(batch_samples.keys())}"
             )
 
