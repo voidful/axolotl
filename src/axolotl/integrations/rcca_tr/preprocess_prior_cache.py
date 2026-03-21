@@ -194,7 +194,12 @@ def main():
     all_margin = []
 
     # Process in batches
-    for start_idx in tqdm(range(0, len(dataset), args.batch_size)):
+    for start_idx in tqdm(
+        range(0, len(dataset), args.batch_size),
+        desc="Cache Gen [Rank 0]",
+        disable=(rank != 0),
+        mininterval=2.0
+    ):
         end_idx = min(start_idx + args.batch_size, len(dataset))
         batch_samples = dataset[start_idx:end_idx]
 
