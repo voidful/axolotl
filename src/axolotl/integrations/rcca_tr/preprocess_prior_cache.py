@@ -152,6 +152,34 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 
+    # --- HPC NFS DDoS Bypass ---
+    # Copy model to local NVMe scratch to prevent NFS mmap crashes across 30 nodes
+    scratch_dir = os.environ.get("LOCAL_SCRATCH", os.environ.get("SLURM_TMPDIR", "/tmp"))
+    local_model_path = os.path.join(scratch_dir, f"hf_cache_{args.base_model.replace('/', '_')}")
+    
+    if local_rank == 0:
+        if not os.path.exists(os.path.join(local_model_path, ".ready")):
+            import shutil
+            from huggingface_hub import snapshot_download
+            try:
+                actual_model_path = snapshot_download(args.base_model, local_files_only=True)
+            except Exception:
+                actual_model_path = args.base_model
+                
+            print(f"[Node Rank 0] Copying model from NFS ({actual_model_path}) to local scratch ({local_model_path}) to prevent NFS mmap collapse...")
+            shutil.copytree(actual_model_path, local_model_path, symlinks=False, dirs_exist_ok=True)
+            with open(os.path.join(local_model_path, ".ready"), "w") as f:
+                f.write("ready")
+            print("[Node Rank 0] Copy complete!")
+
+    import time
+    while not os.path.exists(os.path.join(local_model_path, ".ready")):
+        time.sleep(2)
+        
+    # Override base_model to point to the local NVMe copy
+    args.base_model = local_model_path
+    # ---------------------------
+
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=True)
 
@@ -170,8 +198,8 @@ def main():
     if custom_template:
         tokenizer.chat_template = custom_template
 
-    import time
-    time.sleep(local_rank * 2.5)  # Stagger model loading per GPU to prevent Hugging Face API DDoS
+    # No need to stagger drastically anymore since local NVMe handles it easily, just a tiny stagger
+    time.sleep(local_rank * 0.5)  
     
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
