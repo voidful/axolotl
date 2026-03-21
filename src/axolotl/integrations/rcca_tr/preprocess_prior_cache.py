@@ -371,6 +371,18 @@ def main():
     torch.save(cache_data, cache_path)
     print(f"[Rank {rank}] Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
 
+    if world_size > 1:
+        import datetime
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="gloo", 
+                timeout=datetime.timedelta(hours=24)
+            )
+        print(f"[Rank {rank}] Waiting for all other ranks to finish... (This prevents torchrun 5-minute exit_barrier timeout)")
+        dist.barrier()
+        print(f"[Rank {rank}] All ranks completed!")
+
 
 if __name__ == "__main__":
     main()
