@@ -82,7 +82,13 @@ class RCCATRPlugin(BasePlugin):
     def post_trainer_create(self, cfg: DictDefault, trainer: Trainer):
         cache_path = getattr(cfg, "rcca_tr_prior_cache_path", None)
         if not cache_path:
-            LOG.info("No prior cache path specified. Prior values will be zeros.")
+            if getattr(cfg, "rcca_tr_trainer", False):
+                raise ValueError(
+                    "rcca_tr_prior_cache_path is required when rcca_tr_trainer is True. "
+                    "Run `python -m axolotl.integrations.rcca_tr.preprocess_prior_cache` "
+                    "to generate the prior cache first."
+                )
+            LOG.info("No prior cache path specified and rcca_tr_trainer is not active. Skipping.")
             return
 
         LOG.info("Loading prior cache from %s", cache_path)

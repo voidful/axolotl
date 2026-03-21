@@ -123,6 +123,10 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         # Fallback: zeros if prior values not in batch
         if prior_target_logp is None or prior_margin is None:
+            LOG.warning(
+                "Prior cache values missing from batch. "
+                "Falling back to zero tensors — RCCA-TR will degrade into weighted CE."
+            )
             prior_target_logp = torch.zeros(B, T, device=labels.device)
             prior_margin = torch.zeros(B, T, device=labels.device)
 
@@ -154,6 +158,7 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         r_t = compute_reliability_from_drift(
             drift=drift,
+            valid_mask=valid_mask,
             gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
             tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
         )

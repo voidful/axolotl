@@ -85,6 +85,7 @@ def compute_conflict_score_from_cache(
 
 def compute_reliability_from_drift(
     drift: torch.Tensor,
+    valid_mask: torch.Tensor,
     gamma: float = 1.0,
     tau: float = 1.0,
 ) -> torch.Tensor:
@@ -98,6 +99,7 @@ def compute_reliability_from_drift(
 
     Args:
         drift: Per-token drift values, shape (B, T).
+        valid_mask: Boolean mask for valid tokens, shape (B, T).
         gamma: Scaling factor for drift → reliability.
         tau: Temperature for sigmoid normalization.
 
@@ -106,11 +108,15 @@ def compute_reliability_from_drift(
     """
     r_evi = torch.exp(-gamma * drift)
 
-    # Center and normalize
-    mu = r_evi.mean()
+    # Center and normalize — only over valid (non-padding) tokens
+    if valid_mask.any():
+        mu = r_evi[valid_mask].mean()
+    else:
+        mu = r_evi.mean()
     normalized = (r_evi - mu) / tau
 
     r_t = torch.sigmoid(normalized)
+    r_t = r_t * valid_mask.float()
 
     return r_t
 

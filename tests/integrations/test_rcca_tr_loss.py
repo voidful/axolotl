@@ -104,8 +104,9 @@ class TestReliabilityFromDrift:
     def test_range(self):
         B, T = 4, 20
         drift = torch.rand(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
 
-        r_t = compute_reliability_from_drift(drift)
+        r_t = compute_reliability_from_drift(drift, valid_mask)
         assert r_t.shape == (B, T)
         assert r_t.min() >= 0.0
         assert r_t.max() <= 1.0
@@ -113,10 +114,24 @@ class TestReliabilityFromDrift:
     def test_zero_drift_high_reliability(self):
         B, T = 2, 10
         drift = torch.zeros(B, T)
+        valid_mask = torch.ones(B, T, dtype=torch.bool)
 
-        r_t = compute_reliability_from_drift(drift, gamma=1.0)
+        r_t = compute_reliability_from_drift(drift, valid_mask, gamma=1.0)
         # exp(-0) = 1.0, after sigmoid normalization → ~0.5
         assert r_t.mean() >= 0.4
+
+    def test_padding_does_not_inflate_mean(self):
+        """Regression test: padding tokens should not affect reliability normalization."""
+        B, T = 2, 10
+        drift = torch.rand(B, T) * 2.0
+        valid_mask = torch.zeros(B, T, dtype=torch.bool)
+        valid_mask[:, :5] = True
+
+        r_t = compute_reliability_from_drift(drift, valid_mask, gamma=1.0)
+        # Padding positions should be zero
+        assert torch.all(r_t[:, 5:] == 0.0)
+        # Valid positions should have non-zero values
+        assert r_t[:, :5].sum() > 0.0
 
 
 class TestTrustRegionLossCached:

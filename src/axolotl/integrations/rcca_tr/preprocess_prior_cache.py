@@ -67,22 +67,33 @@ def compute_prior_logits_for_batch(
 
     log_probs = F.log_softmax(logits.float(), dim=-1)  # (B, T, V)
 
-    safe_labels = labels.clamp(min=0)
-    valid_mask = labels != -100
+    # Apply standard causal shift: logits[t] predicts token at position t+1
+    shift_log_probs = log_probs[:, :-1, :]  # (B, T-1, V)
+    shift_labels = input_ids[:, 1:]          # (B, T-1) — next tokens
+    shift_safe_labels = shift_labels.clamp(min=0)
 
-    # log p_0(y_t)
-    prior_target_logp = log_probs.gather(
-        dim=-1, index=safe_labels.unsqueeze(-1)
-    ).squeeze(-1)  # (B, T)
-    prior_target_logp = prior_target_logp * valid_mask.float()
+    # Valid mask: both source and target positions must be valid
+    shift_valid = (labels[:, 1:] != -100) & attention_mask[:, :-1].bool()
 
-    # log p_0(ŷ^(1))
-    prior_top1_logp = log_probs.max(dim=-1).values  # (B, T)
-    prior_top1_logp = prior_top1_logp * valid_mask.float()
+    # log p_0(y_{t+1} | context through t)
+    shifted_target_logp = shift_log_probs.gather(
+        dim=-1, index=shift_safe_labels.unsqueeze(-1)
+    ).squeeze(-1)  # (B, T-1)
+    shifted_target_logp = shifted_target_logp * shift_valid.float()
+
+    # log p_0(top-1 token) at each shifted position
+    shifted_top1_logp = shift_log_probs.max(dim=-1).values  # (B, T-1)
+    shifted_top1_logp = shifted_top1_logp * shift_valid.float()
 
     # margin
-    prior_margin = prior_top1_logp - prior_target_logp  # (B, T)
-    prior_margin = prior_margin * valid_mask.float()
+    shifted_margin = (shifted_top1_logp - shifted_target_logp) * shift_valid.float()
+
+    # Pad back to length T: position 0 = 0.0 (no valid prior for first token)
+    # After this: prior_target_logp[t] = log p_0(input_ids[t] | context through t-1)
+    # for t >= 1, and 0.0 for t = 0.
+    prior_target_logp = F.pad(shifted_target_logp, (1, 0), value=0.0)  # (B, T)
+    prior_top1_logp = F.pad(shifted_top1_logp, (1, 0), value=0.0)      # (B, T)
+    prior_margin = F.pad(shifted_margin, (1, 0), value=0.0)             # (B, T)
 
     return {
         "prior_target_logp": prior_target_logp.cpu(),
@@ -102,10 +113,37 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=8000)
     parser.add_argument("--chat_template", type=str, default=None)
+    parser.add_argument(
+        "--axolotl_config", type=str, default=None,
+        help="Path to axolotl YAML config to extract chat_template_jinja from."
+    )
+    parser.add_argument(
+        "--chat_template_jinja", type=str, default=None,
+        help="Jinja2 template string for chat formatting (overrides tokenizer default)."
+    )
     args = parser.parse_args()
 
     print(f"Loading model: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+
+    # Apply custom chat template if specified
+    custom_template = None
+    if args.axolotl_config:
+        import yaml
+        with open(args.axolotl_config) as f:
+            ax_cfg = yaml.safe_load(f)
+        custom_template = ax_cfg.get("chat_template_jinja")
+        if custom_template:
+            print(f"Using chat_template_jinja from axolotl config: {args.axolotl_config}")
+        else:
+            print(f"Warning: --axolotl_config provided but no chat_template_jinja found")
+    elif args.chat_template_jinja:
+        custom_template = args.chat_template_jinja
+        print("Using provided --chat_template_jinja")
+
+    if custom_template:
+        tokenizer.chat_template = custom_template
+
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,
