@@ -153,7 +153,7 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=True)
 
     # Apply custom chat template if specified
     custom_template = None
@@ -178,7 +178,8 @@ def main():
         torch_dtype=torch.bfloat16,
         device_map={"": local_rank},
         trust_remote_code=True,
-        attn_implementation="sdpa"
+        attn_implementation="sdpa",
+        local_files_only=True
     )
     model.eval()
 
