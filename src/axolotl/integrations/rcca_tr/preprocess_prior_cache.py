@@ -144,6 +144,10 @@ def main():
         print(f"Merged {len(all_tgt)} samples to {args.output_path}.")
         return
 
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
