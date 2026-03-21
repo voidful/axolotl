@@ -166,12 +166,15 @@ def main():
     if custom_template:
         tokenizer.chat_template = custom_template
 
+    import time
+    time.sleep(local_rank * 2.5)  # Stagger model loading per GPU to prevent Hugging Face API DDoS
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,
         device_map={"": local_rank},
         trust_remote_code=True,
-        attn_implementation="flash_attention_2"
+        attn_implementation="sdpa"
     )
     model.eval()
 
