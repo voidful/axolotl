@@ -88,41 +88,72 @@ class RCCATRPlugin(BasePlugin):
                     "Run `python -m axolotl.integrations.rcca_tr.preprocess_prior_cache` "
                     "to generate the prior cache first."
                 )
-            LOG.info("No prior cache path specified and rcca_tr_trainer is not active. Skipping.")
-            return
+        import os
+        import torch.distributed as dist
+        import hashlib
 
-        if (
-            hasattr(trainer, "train_dataset")
-            and trainer.train_dataset is not None
-        ):
-            if "prior_target_logp" in trainer.train_dataset.features:
-                LOG.info("Dataset already contains 'prior_target_logp'. Skipping prior cache loading.")
-                return
+        assert cache_path is not None, "cache_path must be a string here"
+        
+        if not os.path.exists(cache_path):
+            raise ValueError(
+                f"Prior cache file not found at '{cache_path}'. "
+                f"You must generate it before training! Run:\n"
+                f"python -m axolotl.integrations.rcca_tr.preprocess_prior_cache "
+                f"--base_model <YOUR_MODEL> --dataset_path <YOUR_DATA> --output_path {os.path.dirname(cache_path) or './prior_cache'}"
+            )
 
-        LOG.info("Loading prior cache from %s", cache_path)
-        cache = torch.load(cache_path, weights_only=True)
-        num_cache_samples = len(cache["prior_target_logp"])
-        LOG.info("Prior cache loaded: %d samples", num_cache_samples)
+        is_main_process = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
-        def inject_prior(example, idx):
-            seq_len = len(example["input_ids"])
-            if idx < num_cache_samples:
-                cached_logp = cache["prior_target_logp"][idx]
-                cached_margin = cache["prior_margin"][idx]
-                logp_list = cached_logp[:seq_len].tolist()
-                margin_list = cached_margin[:seq_len].tolist()
-                # Pad if cache sequence is shorter than tokenized sequence
-                if len(logp_list) < seq_len:
-                    logp_list += [0.0] * (seq_len - len(logp_list))
-                    margin_list += [0.0] * (seq_len - len(margin_list))
-                example["prior_target_logp"] = logp_list
-                example["prior_margin"] = margin_list
-            else:
-                example["prior_target_logp"] = [0.0] * seq_len
-                example["prior_margin"] = [0.0] * seq_len
-            return example
+        # Create a deterministic fingerprint for the mapped dataset so ranks 1-N can hit the cache
+        # Note: We incorporate the file modification time so that if the prior is regenerated, it remaps.
+        mtime = os.path.getmtime(cache_path)
+        fingerprint = hashlib.md5(f"rcca_tr_prior_{cache_path}_{mtime}".encode()).hexdigest()
 
-        trainer.train_dataset = trainer.train_dataset.map(
-            inject_prior, with_indices=True
-        )
-        LOG.info("Prior cache values injected into training dataset.")
+        if is_main_process:
+            LOG.info("Loading prior cache from %s", cache_path)
+            cache = torch.load(cache_path, weights_only=True)
+            num_cache_samples = len(cache["prior_target_logp"])
+            LOG.info("Prior cache loaded: %d samples", num_cache_samples)
+
+            def inject_prior(example, idx):
+                seq_len = len(example["input_ids"])
+                if idx < num_cache_samples:
+                    cached_logp = cache["prior_target_logp"][idx]
+                    cached_margin = cache["prior_margin"][idx]
+                    logp_list = cached_logp[:seq_len].tolist()
+                    margin_list = cached_margin[:seq_len].tolist()
+                    # Pad if cache sequence is shorter than tokenized sequence
+                    if len(logp_list) < seq_len:
+                        logp_list += [0.0] * (seq_len - len(logp_list))
+                        margin_list += [0.0] * (seq_len - len(margin_list))
+                    example["prior_target_logp"] = logp_list
+                    example["prior_margin"] = margin_list
+                else:
+                    example["prior_target_logp"] = [0.0] * seq_len
+                    example["prior_margin"] = [0.0] * seq_len
+                return example
+
+            trainer.train_dataset = trainer.train_dataset.map(
+                inject_prior, 
+                with_indices=True,
+                new_fingerprint=fingerprint,
+                load_from_cache_file=True,
+                desc="Injecting RCCA-TR prior cache (Rank 0)"
+            )
+            LOG.info("Prior cache values injected into training dataset. Releasing memory.")
+            del cache
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not is_main_process:
+            LOG.info("Loading injected prior cache directly from arrow cache...")
+            def dummy_inject(example, idx):
+                return example
+
+            trainer.train_dataset = trainer.train_dataset.map(
+                dummy_inject, 
+                with_indices=True,
+                new_fingerprint=fingerprint,
+                load_from_cache_file=True,
+            )
