@@ -284,8 +284,28 @@ def main():
             texts = []
             for i in range(len(batch_samples[messages_col])):
                 msgs = batch_samples[messages_col][i]
+                
+                # Auto-convert ShareGPT format to standard HuggingFace messages format
+                standard_msgs = []
+                if isinstance(msgs, list):
+                    for m in msgs:
+                        if isinstance(m, dict):
+                            if "from" in m and "value" in m:
+                                role = "user" if m["from"] in ["human", "user"] else "assistant"
+                                content = m["value"] if m["value"] is not None else ""
+                                standard_msgs.append({"role": role, "content": content})
+                            elif "role" in m and "content" in m:
+                                content = m["content"] if m["content"] is not None else ""
+                                standard_msgs.append({"role": m["role"], "content": content})
+                            else:
+                                standard_msgs.append(m)
+                        else:
+                            standard_msgs.append(m)
+                else:
+                    standard_msgs = msgs
+
                 text = tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=False
+                    standard_msgs, tokenize=False, add_generation_prompt=False
                 )
                 texts.append(text)
         elif "text" in batch_samples:
