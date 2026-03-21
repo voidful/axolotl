@@ -112,6 +112,7 @@ def main():
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=8000)
+    parser.add_argument("--merge_dir", type=str, default=None, help="If provided, merges all rank cache chunks in dir to output_path and exits.")
     parser.add_argument("--chat_template", type=str, default=None)
     parser.add_argument(
         "--axolotl_config", type=str, default=None,
@@ -123,7 +124,31 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading model: {args.base_model}")
+    if args.merge_dir:
+        print(f"Merging cache chunks from {args.merge_dir} into {args.output_path}...")
+        import glob
+        chunks = glob.glob(os.path.join(args.merge_dir, "prior_cache_rank_*.pt"))
+        all_tgt, all_top1, all_mrgn = [], [], []
+        # sort by rank numerically carefully
+        chunks = sorted(chunks, key=lambda x: int(os.path.basename(x).split('_rank_')[-1].split('.pt')[0]))
+        for f in tqdm(chunks, desc="Merging"):
+            c = torch.load(f, weights_only=False)
+            all_tgt.extend(c['prior_target_logp'])
+            all_top1.extend(c['prior_top1_logp'])
+            all_mrgn.extend(c['prior_margin'])
+        torch.save({
+            "prior_target_logp": all_tgt,
+            "prior_top1_logp": all_top1,
+            "prior_margin": all_mrgn,
+        }, args.output_path)
+        print(f"Merged {len(all_tgt)} samples to {args.output_path}.")
+        return
+
+    rank = int(os.environ.get("SLURM_PROCID", "0"))
+    world_size = int(os.environ.get("SLURM_NTASKS", "1"))
+    local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
+
+    print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
     # Apply custom chat template if specified
@@ -133,13 +158,10 @@ def main():
         with open(args.axolotl_config) as f:
             ax_cfg = yaml.safe_load(f)
         custom_template = ax_cfg.get("chat_template_jinja")
-        if custom_template:
+        if custom_template and rank == 0:
             print(f"Using chat_template_jinja from axolotl config: {args.axolotl_config}")
-        else:
-            print(f"Warning: --axolotl_config provided but no chat_template_jinja found")
     elif args.chat_template_jinja:
         custom_template = args.chat_template_jinja
-        print("Using provided --chat_template_jinja")
 
     if custom_template:
         tokenizer.chat_template = custom_template
@@ -147,18 +169,25 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map={"": local_rank},
         trust_remote_code=True,
+        attn_implementation="flash_attention_2"
     )
     model.eval()
 
-    print(f"Loading dataset: {args.dataset_path}")
-    dataset = load_dataset(args.dataset_path, split=args.dataset_split)
+    output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir = Path(args.output_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Processing {len(dataset)} samples...")
+    print(f"[Rank {rank}] Dataset total length: {len(dataset)}")
+    
+    if world_size > 1:
+        chunk_size = (len(dataset) + world_size - 1) // world_size
+        start_sample = rank * chunk_size
+        end_sample = min((rank + 1) * chunk_size, len(dataset))
+        dataset = dataset.select(range(start_sample, end_sample))
+    
+    print(f"[Rank {rank}] Processing {len(dataset)} samples...")
 
     all_target_logp = []
     all_top1_logp = []
@@ -225,9 +254,15 @@ def main():
         "prior_top1_logp": all_top1_logp,
         "prior_margin": all_margin,
     }
-    cache_path = output_dir / "prior_cache.pt"
+    if world_size > 1:
+        cache_path = output_dir / f"prior_cache_rank_{rank}.pt"
+    else:
+        cache_path = Path(args.output_path)
+        if cache_path.is_dir():
+            cache_path = cache_path / "prior_cache.pt"
+            
     torch.save(cache_data, cache_path)
-    print(f"Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
+    print(f"[Rank {rank}] Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
 
 
 if __name__ == "__main__":
