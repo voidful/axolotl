@@ -149,7 +149,7 @@ def main():
     os.environ["HF_HUB_OFFLINE"] = "1"
     
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
+    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1"))) 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 
     # --- HPC NFS DDoS Bypass ---
@@ -198,8 +198,15 @@ def main():
     if custom_template:
         tokenizer.chat_template = custom_template
 
-    # No need to stagger drastically anymore since local NVMe handles it easily, just a tiny stagger
-    time.sleep(local_rank * 0.5)  
+    # Strictly stagger model loading sequentially per local GPU to prevent Virtual Memory (mmap) explosion!
+    # By forcing them to load one by one, we keep the peak VM at 54GB instead of 54GB * 8 = 432GB (which crashes).
+    if local_rank > 0:
+        prev_flag = os.path.join(args.base_model, f".loaded_{local_rank-1}")
+        print(f"[Rank {rank}] Waiting for local_rank {local_rank-1} to finish loading to save VM...")
+        while not os.path.exists(prev_flag):
+            import time
+            time.sleep(2)
+
     
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -211,10 +218,23 @@ def main():
     )
     model.eval()
 
+    model.eval()
+    
+    import gc
+    gc.collect() # Force garbage collect the mmap file handles to free VM
+
+    # Signal next local process that it is safe to load its own copy
+    with open(os.path.join(args.base_model, f".loaded_{local_rank}"), "w") as f:
+        f.write("loaded")
+
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
+
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    from datasets import load_dataset
+    dataset = load_dataset(args.dataset_path, split=args.dataset_split)
+    
     print(f"[Rank {rank}] Dataset total length: {len(dataset)}")
     
     if world_size > 1:
