@@ -61,32 +61,44 @@ def compute_prior_logits_for_batch(
     Returns:
         Dict with prior_target_logp, prior_top1_logp, prior_margin, each (B, T).
     """
+    B, T = input_ids.shape
+    
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits  # (B, T, V)
-
-    log_probs = F.log_softmax(logits.float(), dim=-1)  # (B, T, V)
-
-    # Apply standard causal shift: logits[t] predicts token at position t+1
-    shift_log_probs = log_probs[:, :-1, :]  # (B, T-1, V)
-    shift_labels = input_ids[:, 1:]          # (B, T-1) — next tokens
-    shift_safe_labels = shift_labels.clamp(min=0)
-
-    # Valid mask: both source and target positions must be valid
-    shift_valid = (labels[:, 1:] != -100) & attention_mask[:, :-1].bool()
-
-    # log p_0(y_{t+1} | context through t)
-    shifted_target_logp = shift_log_probs.gather(
-        dim=-1, index=shift_safe_labels.unsqueeze(-1)
-    ).squeeze(-1)  # (B, T-1)
-    shifted_target_logp = shifted_target_logp * shift_valid.float()
-
-    # log p_0(top-1 token) at each shifted position
-    shifted_top1_logp = shift_log_probs.max(dim=-1).values  # (B, T-1)
-    shifted_top1_logp = shifted_top1_logp * shift_valid.float()
-
-    # margin
-    shifted_margin = (shifted_top1_logp - shifted_target_logp) * shift_valid.float()
+        # 1. Forward base model without lm_head to save ~150GB VRAM on batch_size=32
+        base_model = getattr(model, model.base_model_prefix) if hasattr(model, "base_model_prefix") else model.model
+        base_outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        hidden_states = base_outputs[0] if isinstance(base_outputs, tuple) else base_outputs.last_hidden_state
+        
+        shifted_target_logp = torch.zeros(B, T-1, device=input_ids.device)
+        shifted_top1_logp = torch.zeros(B, T-1, device=input_ids.device)
+        
+        # 2. Iterate batch items and sequence chunks to compute lm_head without exploding memory
+        chunk_size = 1024 # [1, 1024, 151936] = ~600MB
+        
+        for b in range(B):
+            for i in range(0, T - 1, chunk_size):
+                i_end = min(i + chunk_size, T - 1)
+                
+                h_chunk = hidden_states[b:b+1, i:i_end, :] # [1, C, D]
+                logits_chunk = model.lm_head(h_chunk)      # [1, C, V]
+                
+                log_probs_chunk = F.log_softmax(logits_chunk.float(), dim=-1) # [1, C, V]
+                
+                # shift targets and masks
+                labels_chunk = labels[b:b+1, i+1:i_end+1] # [1, C]
+                safe_labels_chunk = labels_chunk.clamp(min=0)
+                valid_chunk = (labels_chunk != -100) & attention_mask[b:b+1, i:i_end].bool()
+                
+                target_lp = log_probs_chunk.gather(dim=-1, index=safe_labels_chunk.unsqueeze(-1)).squeeze(-1) # [1, C]
+                top1_lp = log_probs_chunk.max(dim=-1).values # [1, C]
+                
+                shifted_target_logp[b:b+1, i:i_end] = target_lp * valid_chunk.float()
+                shifted_top1_logp[b:b+1, i:i_end] = top1_lp * valid_chunk.float()
+                
+                del h_chunk, logits_chunk, log_probs_chunk
+                
+        shifted_margin = (shifted_top1_logp - shifted_target_logp)
 
     # Pad back to length T: position 0 = 0.0 (no valid prior for first token)
     # After this: prior_target_logp[t] = log p_0(input_ids[t] | context through t-1)
