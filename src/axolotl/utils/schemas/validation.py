@@ -128,7 +128,6 @@ class DatasetValidationMixin:
         ):
             LOG.info(
                 "explicitly setting `eval_sample_packing` to match `sample_packing`",
-                main_process_only=True,
             )
             data["eval_sample_packing"] = True
 
@@ -252,6 +251,23 @@ class TrainingValidationMixin:
             )
             if data.get("pad_to_sequence_len") is None:
                 data["pad_to_sequence_len"] = True
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_reward_model_defaults(cls, data):
+        if data.get("reward_model"):
+            if data.get("num_labels") is None:
+                data["num_labels"] = 1
+            if not (data.get("type_of_model") or data.get("model_type")):
+                data["model_type"] = "AutoModelForSequenceClassification"
+
+        if data.get("process_reward_model"):
+            if data.get("num_labels") is None:
+                data["num_labels"] = 2
+            if not (data.get("type_of_model") or data.get("model_type")):
+                data["model_type"] = "AutoModelForTokenClassification"
+
         return data
 
     @model_validator(mode="before")
@@ -678,20 +694,6 @@ class LoRAValidationMixin:
 
     @model_validator(mode="before")
     @classmethod
-    def check_lora_kernels_rl(cls, data):
-        if (
-            data.get("lora_mlp_kernel")
-            or data.get("lora_qkv_kernel")
-            or data.get("lora_o_kernel")
-        ) and data.get("rl"):
-            raise ValueError(
-                "lora_mlp_kernel, lora_qkv_kernel, and lora_o_kernel are not "
-                "compatible with RL at the moment."
-            )
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def check_lora_kernels_trust_remote_code(cls, data):
         if (
             data.get("lora_mlp_kernel")
@@ -788,6 +790,14 @@ class OptimizationValidationMixin:
             LOG.warning("adamw hyperparameters found, but no adamw optimizer set")
         return self
 
+    @staticmethod
+    def _resolve_fsdp_version(data):
+        """Resolve FSDP version from top-level fsdp_version or fsdp_config.fsdp_version."""
+        fsdp_version = data.get("fsdp_version")
+        if fsdp_version is None:
+            fsdp_version = data.get("fsdp_config", {}).get("fsdp_version", 1)
+        return fsdp_version
+
     @model_validator(mode="before")
     @classmethod
     def check_muon_deepspeed_fsdp(cls, data):
@@ -797,12 +807,29 @@ class OptimizationValidationMixin:
                     "Muon optimizer is currently incompatible with DeepSpeed"
                 )
             if data.get("fsdp") or data.get("fsdp_config"):
-                fsdp_version = data.get("fsdp_version")
-                if fsdp_version is None:
-                    fsdp_version = data.get("fsdp_config", {}).get("fsdp_version", 1)
+                fsdp_version = cls._resolve_fsdp_version(data)
                 if str(fsdp_version) != "2":
                     raise ValueError(
                         "Muon optimizer is only compatible with FSDP2. Set fsdp_version: 2 to use Muon with FSDP."
+                    )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_flashoptim_deepspeed_fsdp(cls, data):
+        optimizer = data.get("optimizer") or ""
+        if str(optimizer).startswith("flash_"):
+            if data.get("deepspeed"):
+                raise ValueError(
+                    f"{optimizer} optimizer is incompatible with DeepSpeed. "
+                    "Flash optimizers only support DDP and FSDP2."
+                )
+            if data.get("fsdp") or data.get("fsdp_config"):
+                fsdp_version = cls._resolve_fsdp_version(data)
+                if str(fsdp_version) != "2":
+                    raise ValueError(
+                        f"{optimizer} optimizer is only compatible with FSDP2. "
+                        "Set fsdp_version: 2 to use flash optimizers with FSDP."
                     )
         return data
 

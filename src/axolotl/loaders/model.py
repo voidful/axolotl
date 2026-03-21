@@ -215,6 +215,8 @@ class ModelLoader:
             self.model_kwargs["revision"] = self.cfg.revision_of_model
         if self.cfg.use_kernels:
             self.model_kwargs["use_kernels"] = self.cfg.use_kernels
+            if "allow_all_kernels" not in self.model_kwargs:
+                self.model_kwargs["allow_all_kernels"] = self.cfg.use_kernels
         self._set_quantization_config()
         self._set_attention_config()
         self._check_model_requirements()
@@ -502,6 +504,20 @@ class ModelLoader:
             # For other FSDP cases, don't set device_map at all
         elif not is_ds_zero3:
             self.model_kwargs["device_map"] = device_map
+
+            # quantize_moe_experts quantizes expert weights on-the-fly during loading,
+            # so the actual VRAM usage is much less than bf16 estimates.
+            # When device_map is "auto", accelerate's infer_auto_device_map computes
+            # the device map at bf16 size (before quantization), causing it to offload
+            # layers to CPU, which BnB then rejects. Force single-GPU placement to
+            # prevent this. Only applies to the non-FSDP, non-ZeRO3 path (DDP/single).
+            if getattr(self.cfg, "quantize_moe_experts", False) and device_map in (
+                "auto",
+                None,
+            ):
+                self.model_kwargs["device_map"] = {
+                    "": int(os.environ.get("LOCAL_RANK", 0))
+                }
 
             cur_device = get_device_type()
             if "mps" in str(cur_device):
@@ -829,8 +845,9 @@ class ModelLoader:
     def _set_z3_leaf_modules(self):
         from deepspeed.utils import set_z3_leaf_modules
 
-        if self.cfg.model_config_type in MOE_ARCH_BLOCK:
-            moe_blocks = MOE_ARCH_BLOCK[self.cfg.model_config_type]
+        moe_type = self.cfg.model_config_type_text or self.cfg.model_config_type
+        if moe_type in MOE_ARCH_BLOCK:
+            moe_blocks = MOE_ARCH_BLOCK[moe_type]
             moe_blocks = [moe_blocks] if isinstance(moe_blocks, str) else moe_blocks
             set_z3_leaf_modules(
                 self.model,

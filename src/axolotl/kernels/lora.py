@@ -25,7 +25,7 @@ def get_lora_parameters(
 ) -> tuple[
     torch.Tensor,
     torch.Tensor | None,
-    QuantState | None,
+    QuantState | torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     float | None,
@@ -48,9 +48,13 @@ def get_lora_parameters(
 
     if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
         quant_state = getattr(W, "quant_state", None)
+        if quant_state is None and W.dtype == torch.float8_e4m3fn:
+            quant_state = getattr(base_layer, "weight_scale_inv", None)
         return W, b, quant_state, None, None, None
 
     quant_state = getattr(W, "quant_state", None)
+    if quant_state is None and W.dtype == torch.float8_e4m3fn:
+        quant_state = getattr(base_layer, "weight_scale_inv", None)
 
     active_adapter = (
         proj.active_adapters[0]
@@ -81,7 +85,7 @@ def matmul_lora(
     X: torch.Tensor,
     W: torch.Tensor,
     b: torch.Tensor | None,
-    W_quant: QuantState | None,
+    W_quant: QuantState | torch.Tensor | None,
     A: torch.Tensor | None,
     B: torch.Tensor | None,
     s: float | None,
@@ -636,7 +640,9 @@ class LoRA_QKV(torch.autograd.Function):
         del q_weight
         del q_weight_t
         if A_q is not None and B_q is not None:
-            grad_X.addmm_(q_grad, torch.mm(B_q_scaled, A_q_scaled))
+            # Stay decomposed: dQ @ B^T gives [T, R], then [T, R] @ (s*A) gives [T, in]
+            # This is 65x fewer FLOPs than materializing B@A into [out, in]
+            grad_X.addmm_(torch.mm(q_grad, B_q_scaled), A_q_scaled)
 
         # K path
         k_weight_t = dequantize(k_weight, k_quant)
@@ -644,7 +650,7 @@ class LoRA_QKV(torch.autograd.Function):
         del k_weight
         del k_weight_t
         if A_k is not None and B_k is not None:
-            grad_X.addmm_(k_grad, torch.mm(B_k_scaled, A_k_scaled))
+            grad_X.addmm_(torch.mm(k_grad, B_k_scaled), A_k_scaled)
 
         # V path
         v_weight_t = dequantize(v_weight, v_quant)
@@ -652,7 +658,7 @@ class LoRA_QKV(torch.autograd.Function):
         del v_weight
         del v_weight_t
         if A_v is not None and B_v is not None:
-            grad_X.addmm_(v_grad, torch.mm(B_v_scaled, A_v_scaled))
+            grad_X.addmm_(torch.mm(v_grad, B_v_scaled), A_v_scaled)
 
         # Transpose gradients if needed
         if d_A_q is not None:
@@ -815,7 +821,8 @@ class LoRA_O(torch.autograd.Function):
         del W
 
         A, B = A.to(dtype), B.to(dtype)
-        dX += s * dY @ B @ A
+        # Stay decomposed: dY @ B gives [T, R], then [T, R] @ A gives [T, in]
+        dX.addmm_(torch.mm(dY, B), A, alpha=s)
 
         # W, b, W_quant, A, B, s
         return dX.view(batch, seq_len, hd), None, None, None, d_A.t(), d_B.t(), None
