@@ -825,12 +825,22 @@ class ModelLoader:
             is_zero3 = is_deepspeed_zero3_enabled() or os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE") == "3"
             if is_zero3:
                 import deepspeed
+                local_rank = int(os.getenv("LOCAL_RANK", "0"))
+                local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+                
                 with deepspeed.zero.Init():
                     if self.cfg.reinit_weights:
                         self.model = self._load_model_from_config(model_loader_class)
                     else:
-                        self.model = self._load_model_from_pretrained(model_loader_class)
-            else:
+                        # Prevent simultaneous CPU memory map OOM across the same node.
+                        if torch.distributed.is_initialized():
+                            for r in range(local_world_size):
+                                if r == local_rank:
+                                    LOG.info(f"Loading ZeRO-3 model on local_rank {local_rank}...")
+                                    self.model = self._load_model_from_pretrained(model_loader_class)
+                                torch.distributed.barrier()
+                        else:
+                            self.model = self._load_model_from_pretrained(model_loader_class)
                 if self.cfg.reinit_weights:
                     self.model = self._load_model_from_config(model_loader_class)
                 else:
