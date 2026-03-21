@@ -323,3 +323,106 @@ class TestDriftBuffer:
         plugin = RCCATRPlugin()
         assert plugin.get_input_args() == "axolotl.integrations.rcca_tr.RCCATRArgs"
         assert plugin.get_training_args_mixin() == "axolotl.integrations.rcca_tr.args.RCCATRTrainingArgsMixin"
+
+
+class TestCollatorShapeAlignment:
+    """Integration tests: collator produces aligned shapes for RCCA-TR fields."""
+
+    def _make_sample(self, seq_len, vocab_size=100):
+        input_ids = list(torch.randint(0, vocab_size, (seq_len,)).numpy())
+        labels = list(torch.randint(0, vocab_size, (seq_len,)).numpy())
+        # Mask first 3 tokens as prompt (labels = -100)
+        for i in range(min(3, seq_len)):
+            labels[i] = -100
+        attention_mask = [1] * seq_len
+        prior_target_logp = torch.randn(seq_len).tolist()
+        prior_margin = torch.rand(seq_len).tolist()
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "prior_target_logp": prior_target_logp,
+            "prior_margin": prior_margin,
+        }
+
+    def test_single_samples_aligned(self):
+        """RCCA fields must match input_ids seq_len after collation."""
+        from unittest.mock import MagicMock
+        from axolotl.integrations.rcca_tr.collator import DataCollatorForRCCATR
+
+        tokenizer = MagicMock()
+        tokenizer.padding_side = "right"
+        tokenizer.pad = lambda features, **kwargs: {
+            k: torch.tensor([f[k] for f in features])
+            if isinstance(features[0][k], list)
+            else torch.stack([f[k] for f in features])
+            for k in features[0]
+        }
+        tokenizer.deprecation_warnings = {}
+
+        collator = DataCollatorForRCCATR(tokenizer=tokenizer)
+        samples = [self._make_sample(20), self._make_sample(15)]
+        batch = collator(samples)
+
+        seq_len = batch["input_ids"].shape[1]
+        assert batch["prior_target_logp"].shape == (2, seq_len)
+        assert batch["prior_margin"].shape == (2, seq_len)
+
+    def test_packed_samples_aligned(self):
+        """RCCA fields must stay aligned after packing concatenation."""
+        from unittest.mock import MagicMock
+        from axolotl.integrations.rcca_tr.collator import DataCollatorForRCCATR
+
+        tokenizer = MagicMock()
+        tokenizer.padding_side = "right"
+        tokenizer.pad = lambda features, **kwargs: {
+            k: torch.tensor([f[k] for f in features])
+            if isinstance(features[0][k], list)
+            else torch.stack([f[k] for f in features])
+            for k in features[0]
+        }
+        tokenizer.deprecation_warnings = {}
+
+        collator = DataCollatorForRCCATR(tokenizer=tokenizer)
+        # Simulate packed batch: 2 bins, each with 2 samples
+        packed = [
+            [self._make_sample(10), self._make_sample(8)],
+            [self._make_sample(12), self._make_sample(6)],
+        ]
+        batch = collator(packed)
+
+        seq_len = batch["input_ids"].shape[1]
+        assert batch["prior_target_logp"].shape[1] == seq_len
+        assert batch["prior_margin"].shape[1] == seq_len
+
+
+class TestMaskedCacheDoesNotAffectLoss:
+    """Prior cache values at labels==-100 positions must not affect the loss."""
+
+    def test_masked_positions_are_inert(self):
+        B, T, V = 2, 20, 50
+        active_logits = torch.randn(B, T, V)
+        labels = torch.randint(0, V, (B, T))
+        # Mask first half as prompt
+        labels[:, :10] = -100
+
+        alpha_t = torch.rand(B, T)
+        r_t = torch.rand(B, T)
+
+        # Run with real prior cache values
+        prior_logp_real = torch.randn(B, T)
+        loss_real, _ = compute_trust_region_loss_cached(
+            active_logits, labels, alpha_t, r_t, prior_logp_real
+        )
+
+        # Run with zeroed prior at masked positions (should be identical)
+        prior_logp_zeroed = prior_logp_real.clone()
+        prior_logp_zeroed[:, :10] = 0.0
+        loss_zeroed, _ = compute_trust_region_loss_cached(
+            active_logits, labels, alpha_t, r_t, prior_logp_zeroed
+        )
+
+        # Losses should be identical since masked positions don't contribute
+        assert torch.allclose(loss_real, loss_zeroed, atol=1e-6), (
+            f"Loss differs: {loss_real.item()} vs {loss_zeroed.item()}"
+        )

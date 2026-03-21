@@ -110,7 +110,7 @@ class DataCollatorForRCCATR(DataCollatorForSeq2Seq):
                                 [remainder, f[feature_name]]
                             ).astype(np.int64)
 
-        # Extract RCCA-TR fields before tokenizer.pad()
+        # Extract RCCA-TR fields before tokenizer.pad() (tokenizer doesn't know them)
         rcca_data = {}
         has_rcca_fields = all(field in features[0] for field in RCCA_TR_FIELDS)
 
@@ -118,17 +118,23 @@ class DataCollatorForRCCATR(DataCollatorForSeq2Seq):
             for field in RCCA_TR_FIELDS:
                 rcca_data[field] = [f.pop(field) for f in features]
 
-            # Determine max length for padding
-            rcca_max_len = max_len or max(
-                len(seq) for seq in rcca_data[RCCA_TR_FIELDS[0]]
-            )
+        # Pad standard fields using tokenizer
+        features = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=return_tensors,
+        )
 
-            # Pad each field to rcca_max_len with 0.0
+        # Pad RCCA-TR fields to match the final batch sequence length
+        if has_rcca_fields:
+            final_seq_len = features["input_ids"].shape[1]
             padded = {}
             for field in RCCA_TR_FIELDS:
                 padded_seqs = []
                 for seq in rcca_data[field]:
-                    pad_len = rcca_max_len - len(seq)
+                    pad_len = final_seq_len - len(seq)
                     if isinstance(seq, list):
                         padded_seq = (
                             seq + [0.0] * pad_len
@@ -143,19 +149,9 @@ class DataCollatorForRCCATR(DataCollatorForSeq2Seq):
                             else np.concatenate([remainder, seq])
                         )
                     padded_seqs.append(padded_seq)
-                padded[field] = torch.tensor(padded_seqs, dtype=torch.float32)
-
-        # Pad standard fields using tokenizer
-        features = self.tokenizer.pad(
-            features,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=return_tensors,
-        )
-
-        # Add back RCCA-TR fields
-        if has_rcca_fields:
+                padded[field] = torch.as_tensor(
+                    np.array(padded_seqs), dtype=torch.float32
+                )
             for field in RCCA_TR_FIELDS:
                 features[field] = padded[field]
 
