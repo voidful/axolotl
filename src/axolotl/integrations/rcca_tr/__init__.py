@@ -91,6 +91,14 @@ class RCCATRPlugin(BasePlugin):
             LOG.info("No prior cache path specified and rcca_tr_trainer is not active. Skipping.")
             return
 
+        if (
+            hasattr(trainer, "train_dataset")
+            and trainer.train_dataset is not None
+        ):
+            if "prior_target_logp" in trainer.train_dataset.features:
+                LOG.info("Dataset already contains 'prior_target_logp'. Skipping prior cache loading.")
+                return
+
         LOG.info("Loading prior cache from %s", cache_path)
         cache = torch.load(cache_path, weights_only=True)
         num_cache_samples = len(cache["prior_target_logp"])
