@@ -222,7 +222,7 @@ def main():
             device_map={"": local_rank},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=True
+            local_files_only=False
         )
         model.eval()
         import gc
