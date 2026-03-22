@@ -54,6 +54,58 @@ def _inject_fla_kernels(module) -> None:
             chunk_gated_delta_rule,
             fused_recurrent_gated_delta_rule,
         )
+        import fla.ops.utils.cumsum as cumsum_mod
+
+        # Apply issue #734 workaround: patch buggy chunk_local_cumsum_scalar Triton kernel
+        # with a PyTorch equivalent to prevent 'invalid argument' crash during packed training.
+        _original_cumsum = cumsum_mod.chunk_local_cumsum_scalar
+
+        def _pytorch_cumsum(
+            g,
+            chunk_size,
+            reverse=False,
+            scale=None,
+            cu_seqlens=None,
+            head_first=False,
+            output_dtype=torch.float,
+            chunk_indices=None,
+        ):
+            if cu_seqlens is not None:
+                return _original_cumsum(
+                    g, chunk_size, reverse, scale,
+                    cu_seqlens, head_first, output_dtype, chunk_indices
+                )
+
+            if head_first:
+                B, H, T = g.shape
+            else:
+                B, T, H = g.shape
+                g = g.transpose(1, 2)
+
+            BT = chunk_size
+            pad = (BT - T % BT) % BT
+            if pad > 0:
+                g = torch.nn.functional.pad(g, (0, pad))
+
+            g_chunked = g.reshape(B, H, -1, BT).to(torch.float32)
+            o = g_chunked.flip(-1).cumsum(-1).flip(-1) if reverse else g_chunked.cumsum(-1)
+
+            if scale is not None:
+                o = o * scale
+
+            o = o.reshape(B, H, -1)
+            if pad > 0:
+                o = o[:, :, :T]
+
+            o = o.to(output_dtype or g.dtype)
+
+            if not head_first:
+                o = o.transpose(1, 2)
+
+            return o.contiguous()
+
+        cumsum_mod.chunk_local_cumsum_scalar = _pytorch_cumsum
+        LOG.info("Patched fla.ops.utils.cumsum.chunk_local_cumsum_scalar with PyTorch equivalent")
 
         module.FusedRMSNormGated = FusedRMSNormGated
         module.chunk_gated_delta_rule = chunk_gated_delta_rule

@@ -1,5 +1,8 @@
 base_model: Qwen/Qwen3.5-27B
 low_cpu_mem_usage: true
+sample_packing: true
+eval_sample_packing: false
+pad_to_sequence_len: false
 
 plugins:
   - axolotl.integrations.rcca_tr.RCCATRPlugin
