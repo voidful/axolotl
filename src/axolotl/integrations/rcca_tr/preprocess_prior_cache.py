@@ -255,6 +255,12 @@ def main():
     with open(os.path.join(args.base_model, f".loaded_{job_id}_{local_rank}"), "w") as f:
         f.write("loaded")
 
+    # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
+    print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
 
     if rank == 0:
