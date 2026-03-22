@@ -205,48 +205,17 @@ def main():
     import time
     import fcntl
     
-    # ==================================================================================
-    # CRITICAL: Only use 4 GPUs per node (local_rank 0-3) for model loading.
-    #
-    # safetensors 0.7.0 uses mmap() unconditionally (no use_mmap parameter exists).
-    # Each process reserves ~54GB Virtual Address Space permanently via mmap.
-    # 8 processes × 54GB = 432GB VAS from mmap alone, plus CUDA contexts (~100GB each),
-    # which exceeds the OS/cgroup VAS limit and causes "Cannot allocate memory (12)".
-    #
-    # By using only 4 GPUs per node, we halve the VAS to ~216GB, staying well within limits.
-    # ==================================================================================
-    MAX_GPUS_PER_NODE = 4
-    
-    if local_rank >= MAX_GPUS_PER_NODE:
-        print(f"[Rank {rank}] local_rank={local_rank} >= {MAX_GPUS_PER_NODE}, skipping model loading to save VAS. Waiting at barrier...")
-        import torch.distributed as dist
-        import datetime
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend="nccl" if torch.cuda.is_available() else "gloo",
-                timeout=datetime.timedelta(hours=4)
-            )
-        dist.barrier()
-        print(f"[Rank {rank}] Barrier passed. Exiting gracefully (no work for this rank).")
-        return
-    
-    # Recalculate effective rank/world_size for data sharding (only active GPUs)
-    num_nodes = int(os.environ.get("NNODES", world_size // 8 if world_size >= 8 else 1))
+    # Stagger model loading across nodes by 3 seconds each to avoid Lustre NFS overload
+    num_nodes = int(os.environ.get("NNODES", world_size // 4 if world_size >= 4 else 1))
     node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
-    effective_rank = node_id * MAX_GPUS_PER_NODE + local_rank
-    effective_world_size = num_nodes * MAX_GPUS_PER_NODE
-    
-    print(f"[Rank {rank}] Active GPU: effective_rank={effective_rank}/{effective_world_size} (node={node_id}, local={local_rank})")
-    
-    # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
     time.sleep(node_id * 3)
     
-    # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations.
+    # OS-level lock serializes loading within each node (prevents concurrent mmap VAS explosion)
     lock_path = f"/tmp/hf_model_load_lock_{os.environ.get('SLURM_JOB_ID', 'local')}.lock"
-    print(f"[Rank {rank} | Node {node_id} Local {local_rank}] Waiting for Node lock {lock_path}...")
+    print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        print(f"[Rank {rank} | Node {node_id} Local {local_rank}] Acquired lock! Loading model {args.base_model} on cuda:{local_rank}...")
+        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
@@ -256,24 +225,23 @@ def main():
             local_files_only=True
         )
         model.eval()
-
         import gc
         gc.collect()
         fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    print(f"[Rank {rank}] Successfully loaded model and released lock!")
+    print(f"[Rank {rank}/{world_size}] Model loaded successfully!")
 
-    # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
-    print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
+    # Global barrier: wait for ALL ranks to finish loading before any inference begins
+    # Use gloo backend (CPU-only) to avoid allocating extra CUDA VAS
     import torch.distributed as dist
     import datetime
-    
     if not dist.is_initialized():
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend="gloo",
             timeout=datetime.timedelta(hours=4)
         )
     dist.barrier()
+    print(f"[Rank {rank}] All ranks loaded. Starting inference...")
 
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
 
@@ -283,12 +251,12 @@ def main():
     from datasets import load_dataset
     dataset = load_dataset(args.dataset_path, split=args.dataset_split)
     
-    print(f"[Rank {rank}] Dataset total length: {len(dataset)} (effective_rank={effective_rank}/{effective_world_size})")
+    print(f"[Rank {rank}] Dataset total length: {len(dataset)}")
     
-    if effective_world_size > 1:
-        chunk_size = (len(dataset) + effective_world_size - 1) // effective_world_size
-        start_sample = effective_rank * chunk_size
-        end_sample = min((effective_rank + 1) * chunk_size, len(dataset))
+    if world_size > 1:
+        chunk_size = (len(dataset) + world_size - 1) // world_size
+        start_sample = rank * chunk_size
+        end_sample = min((rank + 1) * chunk_size, len(dataset))
         dataset = dataset.select(range(start_sample, end_sample))
     
     print(f"[Rank {rank}] Processing {len(dataset)} samples...")
@@ -383,8 +351,8 @@ def main():
         "prior_top1_logp": all_top1_logp,
         "prior_margin": all_margin,
     }
-    if effective_world_size > 1:
-        cache_path = output_dir / f"prior_cache_rank_{effective_rank}.pt"
+    if world_size > 1:
+        cache_path = output_dir / f"prior_cache_rank_{rank}.pt"
     else:
         cache_path = Path(args.output_path)
         if cache_path.is_dir():
@@ -393,10 +361,10 @@ def main():
     torch.save(cache_data, cache_path)
     print(f"[Rank {rank}] Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
 
-    if effective_world_size > 1:
-        print(f"[Rank {rank}] Waiting for all active ranks to finish...")
+    if world_size > 1:
+        print(f"[Rank {rank}] Waiting for all ranks to finish...")
         dist.barrier()
-        print(f"[Rank {rank}] All active ranks completed!")
+        print(f"[Rank {rank}] All ranks completed!")
 
 
 if __name__ == "__main__":
