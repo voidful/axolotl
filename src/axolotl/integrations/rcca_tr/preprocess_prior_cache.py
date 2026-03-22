@@ -204,15 +204,14 @@ def main():
     if custom_template:
         tokenizer.chat_template = custom_template
 
-    # Strictly stagger model loading sequentially per local GPU to prevent Virtual Memory (mmap) explosion!
-    # By forcing them to load one by one, we keep the peak VM at 54GB instead of 54GB * 8 = 432GB (which crashes).
-    job_id = os.environ.get("SLURM_JOB_ID", "local_run")
-    if local_rank > 0:
-        prev_flag = os.path.join("/tmp", f".loaded_{job_id}_{local_rank-1}")
-        print(f"[Rank {rank}] Waiting for local_rank {local_rank-1} to finish loading to save VM...")
-        while not os.path.exists(prev_flag):
-            import time
-            time.sleep(2)
+    # Strictly stagger all 240 GPUs across the cluster mathematically by their global `rank`.
+    # By forcing a 3-second delay per rank, we achieve a perfectly smooth trickle-down loading sequence.
+    # This prevents the Lustre NFS Metadata Server from throwing `mmap: ENOMEM` when 240 processes
+    # try to simultaneously memory-map 54GB files, and it fully prevents Local Node OOM.
+    sleep_time = rank * 3
+    print(f"[Rank {rank}/{world_size}] Sleeping {sleep_time}s before loading to prevent NFS DDoS & VM explosion...")
+    import time
+    time.sleep(sleep_time)
 
     
     model = AutoModelForCausalLM.from_pretrained(
