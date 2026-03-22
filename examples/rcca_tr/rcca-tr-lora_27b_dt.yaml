@@ -136,12 +136,12 @@ chat_template_jinja: >-
   {%- endif %}
 
 sequence_len: 8192
-sample_packing: false
+sample_packing: true
 pad_to_sequence_len: false
 
 gradient_accumulation_steps: 2
 micro_batch_size: 1
-batch_flattening: true
+batch_flattening: false
 group_by_length: true
 num_epochs: 3
 optimizer: adamw_torch_fused
