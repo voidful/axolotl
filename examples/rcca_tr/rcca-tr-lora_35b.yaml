@@ -155,7 +155,7 @@ flash_attention: true
 dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
-output_dir: ./outputs/rcca-tr-fft
+output_dir: ./outputs/rcca-tr-35b
 
 deepspeed: deepspeed_configs/zero2.json
 
