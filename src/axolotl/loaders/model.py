@@ -826,21 +826,9 @@ class ModelLoader:
             if is_zero3:
                 import deepspeed
                 import time as _time
+                import fcntl
                 local_rank = int(os.getenv("LOCAL_RANK", "0"))
                 local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
-
-                # Create a node-local process group so barrier only syncs within the same node
-                node_group = None
-                if torch.distributed.is_initialized() and local_world_size > 1:
-                    global_rank = torch.distributed.get_rank()
-                    world_size = torch.distributed.get_world_size()
-                    num_nodes = world_size // local_world_size
-                    # Each node gets its own group: ranks [node_id*local_world_size .. (node_id+1)*local_world_size-1]
-                    for node_id in range(num_nodes):
-                        ranks = list(range(node_id * local_world_size, (node_id + 1) * local_world_size))
-                        group = torch.distributed.new_group(ranks)
-                        if global_rank in ranks:
-                            node_group = group
 
                 _t0 = _time.time()
                 LOG.info("Starting ZeRO-3 model init (local_rank=%d, local_world_size=%d)...", local_rank, local_world_size)
@@ -848,17 +836,19 @@ class ModelLoader:
                     if self.cfg.reinit_weights:
                         self.model = self._load_model_from_config(model_loader_class)
                     else:
-                        # Prevent simultaneous CPU memory map OOM across the same node.
-                        if torch.distributed.is_initialized() and node_group is not None:
-                            for r in range(local_world_size):
-                                if r == local_rank:
-                                    LOG.info(f"Loading ZeRO-3 model on local_rank {local_rank}...")
-                                    _t1 = _time.time()
-                                    self.model = self._load_model_from_pretrained(model_loader_class)
-                                    LOG.info(f"ZeRO-3 model loaded on local_rank {local_rank} in {_time.time()-_t1:.1f}s")
-                                torch.distributed.barrier(group=node_group)
-                        else:
-                            self.model = self._load_model_from_pretrained(model_loader_class)
+                        # Serialize model loading within each node using file lock.
+                        # This avoids collective new_group() calls that stall at large scale.
+                        lock_file = f"/tmp/axolotl_model_load_{os.getenv('SLURM_JOB_ID', 'default')}.lock"
+                        LOG.info(f"Acquiring node-local lock for model loading (local_rank {local_rank})...")
+                        with open(lock_file, "w") as lf:
+                            fcntl.flock(lf, fcntl.LOCK_EX)
+                            try:
+                                LOG.info(f"Loading ZeRO-3 model on local_rank {local_rank}...")
+                                _t1 = _time.time()
+                                self.model = self._load_model_from_pretrained(model_loader_class)
+                                LOG.info(f"ZeRO-3 model loaded on local_rank {local_rank} in {_time.time()-_t1:.1f}s")
+                            finally:
+                                fcntl.flock(lf, fcntl.LOCK_UN)
                 LOG.info("ZeRO-3 init complete in %.1fs", _time.time() - _t0)
                 # Global barrier to ensure all nodes finished before proceeding
                 if torch.distributed.is_initialized():
