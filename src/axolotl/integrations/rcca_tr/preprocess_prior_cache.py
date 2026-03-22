@@ -206,54 +206,47 @@ def main():
     import fcntl
     
     # ==================================================================================
-    # CRITICAL FIX: Disable safetensors mmap to prevent Virtual Address Space exhaustion.
-    # 
-    # safetensors.safe_open() uses mmap() by default, which permanently reserves ~54GB
-    # of Virtual Address Space (VAS) per process for the entire lifetime of the model.
-    # With 8 GPU processes per node, that's 432GB VAS from mmap alone, plus ~100GB per
-    # CUDA context, Python overhead, etc. This exceeds the OS/cgroup VAS limit.
+    # CRITICAL: Only use 4 GPUs per node (local_rank 0-3) for model loading.
     #
-    # By forcing use_mmap=False, safetensors reads files via normal read() syscalls,
-    # freeing ALL Virtual Address Space immediately after weights move to GPU.
+    # safetensors 0.7.0 uses mmap() unconditionally (no use_mmap parameter exists).
+    # Each process reserves ~54GB Virtual Address Space permanently via mmap.
+    # 8 processes × 54GB = 432GB VAS from mmap alone, plus CUDA contexts (~100GB each),
+    # which exceeds the OS/cgroup VAS limit and causes "Cannot allocate memory (12)".
+    #
+    # By using only 4 GPUs per node, we halve the VAS to ~216GB, staying well within limits.
     # ==================================================================================
-    import safetensors
-    from safetensors import safe_open as _original_safe_open
+    MAX_GPUS_PER_NODE = 4
     
-    def _safe_open_no_mmap(*args, **kwargs):
-        kwargs["use_mmap"] = False
-        return _original_safe_open(*args, **kwargs)
+    if local_rank >= MAX_GPUS_PER_NODE:
+        print(f"[Rank {rank}] local_rank={local_rank} >= {MAX_GPUS_PER_NODE}, skipping model loading to save VAS. Waiting at barrier...")
+        import torch.distributed as dist
+        import datetime
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                timeout=datetime.timedelta(hours=4)
+            )
+        dist.barrier()
+        print(f"[Rank {rank}] Barrier passed. Exiting gracefully (no work for this rank).")
+        return
     
-    # Patch every location where transformers could find safe_open
-    safetensors.safe_open = _safe_open_no_mmap
-    try:
-        import safetensors.safetensors_rust
-        safetensors.safetensors_rust.safe_open = _safe_open_no_mmap
-    except (ImportError, ModuleNotFoundError, AttributeError):
-        pass
-    try:
-        import safetensors._safetensors_rust
-        safetensors._safetensors_rust.safe_open = _safe_open_no_mmap
-    except (ImportError, ModuleNotFoundError, AttributeError):
-        pass
-    try:
-        import safetensors.torch
-        if hasattr(safetensors.torch, 'safe_open'):
-            safetensors.torch.safe_open = _safe_open_no_mmap
-    except (ImportError, ModuleNotFoundError, AttributeError):
-        pass
-    print(f"[Rank {rank}] Monkey-patched safetensors to disable mmap (use_mmap=False)")
+    # Recalculate effective rank/world_size for data sharding (only active GPUs)
+    num_nodes = int(os.environ.get("NNODES", world_size // 8 if world_size >= 8 else 1))
+    node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
+    effective_rank = node_id * MAX_GPUS_PER_NODE + local_rank
+    effective_world_size = num_nodes * MAX_GPUS_PER_NODE
+    
+    print(f"[Rank {rank}] Active GPU: effective_rank={effective_rank}/{effective_world_size} (node={node_id}, local={local_rank})")
     
     # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
-    # EVERY GPU on the node must wait, otherwise local_rank=1 rushes the lock and 40 nodes hit NFS simultaneously at T=0!
-    node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
-    time.sleep(node_rank * 3)
+    time.sleep(node_id * 3)
     
     # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations.
     lock_path = f"/tmp/hf_model_load_lock_{os.environ.get('SLURM_JOB_ID', 'local')}.lock"
-    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Waiting for Node lock {lock_path}...")
+    print(f"[Rank {rank} | Node {node_id} Local {local_rank}] Waiting for Node lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Acquired lock! Loading model {args.base_model} on cuda:{local_rank} (mmap DISABLED)...")
+        print(f"[Rank {rank} | Node {node_id} Local {local_rank}] Acquired lock! Loading model {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
@@ -268,15 +261,13 @@ def main():
         gc.collect()
         fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    print(f"[Rank {rank}/{world_size}] Successfully loaded model and released lock!")
+    print(f"[Rank {rank}] Successfully loaded model and released lock!")
 
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
     print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
     import torch.distributed as dist
     import datetime
     
-    # Actually initialize the distributed group so the barrier works!
-    # A generous timeout of 4 hours because the 240 GPUs staggered at 3s + Local locking take ~10-15 minutes to all clear the gate.
     if not dist.is_initialized():
         dist.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
@@ -292,12 +283,12 @@ def main():
     from datasets import load_dataset
     dataset = load_dataset(args.dataset_path, split=args.dataset_split)
     
-    print(f"[Rank {rank}] Dataset total length: {len(dataset)}")
+    print(f"[Rank {rank}] Dataset total length: {len(dataset)} (effective_rank={effective_rank}/{effective_world_size})")
     
-    if world_size > 1:
-        chunk_size = (len(dataset) + world_size - 1) // world_size
-        start_sample = rank * chunk_size
-        end_sample = min((rank + 1) * chunk_size, len(dataset))
+    if effective_world_size > 1:
+        chunk_size = (len(dataset) + effective_world_size - 1) // effective_world_size
+        start_sample = effective_rank * chunk_size
+        end_sample = min((effective_rank + 1) * chunk_size, len(dataset))
         dataset = dataset.select(range(start_sample, end_sample))
     
     print(f"[Rank {rank}] Processing {len(dataset)} samples...")
@@ -392,8 +383,8 @@ def main():
         "prior_top1_logp": all_top1_logp,
         "prior_margin": all_margin,
     }
-    if world_size > 1:
-        cache_path = output_dir / f"prior_cache_rank_{rank}.pt"
+    if effective_world_size > 1:
+        cache_path = output_dir / f"prior_cache_rank_{effective_rank}.pt"
     else:
         cache_path = Path(args.output_path)
         if cache_path.is_dir():
@@ -402,17 +393,10 @@ def main():
     torch.save(cache_data, cache_path)
     print(f"[Rank {rank}] Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
 
-    if world_size > 1:
-        import datetime
-        import torch.distributed as dist
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend="gloo", 
-                timeout=datetime.timedelta(hours=24)
-            )
-        print(f"[Rank {rank}] Waiting for all other ranks to finish... (This prevents torchrun 5-minute exit_barrier timeout)")
+    if effective_world_size > 1:
+        print(f"[Rank {rank}] Waiting for all active ranks to finish...")
         dist.barrier()
-        print(f"[Rank {rank}] All ranks completed!")
+        print(f"[Rank {rank}] All active ranks completed!")
 
 
 if __name__ == "__main__":
