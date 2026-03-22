@@ -31,8 +31,10 @@ Usage:
         --max_length 8000
 """
 
-import argparse
 import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
+import argparse
 from pathlib import Path
 
 import torch
@@ -169,8 +171,6 @@ def main():
         print(f"Merged {len(all_tgt)} samples to {args.output_path}.")
         return
 
-    # To prevent PyTorch Inductor compile workers from hanging during Python atexit on the HPC
-    os.environ["TORCH_COMPILE_DISABLE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
