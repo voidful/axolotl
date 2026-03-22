@@ -204,12 +204,12 @@ def main():
     if custom_template:
         tokenizer.chat_template = custom_template
 
-    # Strictly stagger all 240 GPUs across the cluster mathematically by their global `rank`.
-    # By forcing a 3-second delay per rank, we achieve a perfectly smooth trickle-down loading sequence.
-    # This prevents the Lustre NFS Metadata Server from throwing `mmap: ENOMEM` when 240 processes
-    # try to simultaneously memory-map 54GB files, and it fully prevents Local Node OOM.
-    sleep_time = rank * 3
-    print(f"[Rank {rank}/{world_size}] Sleeping {sleep_time}s before loading to prevent NFS DDoS & VM explosion...")
+    # Implement 2D Mathematical Staggering:
+    # 1. `local_rank * 35`: Forces GPUs on the SAME node to wait 35s for the previous GPU to finish 54GB `mmap` load to prevent OS ENOMEM panic.
+    # 2. `node_rank * 3`: Trickles the 30 nodes so they don't DDoS the Lustre NFS metadata server simultaneously.
+    node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
+    sleep_time = (local_rank * 35) + (node_rank * 3)
+    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Sleeping {sleep_time}s to serialize Local VM and trickle Lustre NFS...")
     import time
     time.sleep(sleep_time)
 
