@@ -33,6 +33,7 @@ Usage:
 
 import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
 from pathlib import Path
