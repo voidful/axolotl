@@ -205,9 +205,9 @@ def main():
     import fcntl
     
     # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
+    # EVERY GPU on the node must wait, otherwise local_rank=1 rushes the lock and 40 nodes hit NFS simultaneously at T=0!
     node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
-    if local_rank == 0:
-        time.sleep(node_rank * 3)
+    time.sleep(node_rank * 3)
     
     # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations 
     # for the 54GB safetensor mmaps, gracefully queueing up all 8 GPUs locally without timing guesswork.
