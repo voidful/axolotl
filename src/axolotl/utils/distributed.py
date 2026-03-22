@@ -235,9 +235,9 @@ def compute_and_broadcast(fn):
 
 
 def gather_from_all_ranks(fn, world_size=1):
-    \"""
+    """
     Run a callable 'fn' on all ranks and all-gather the results.
-    \"""
+    """
     value_scalar = fn()
     value_tensor = torch.tensor(
         value_scalar, device=f"{get_device_type()}:{get_current_device()}"
