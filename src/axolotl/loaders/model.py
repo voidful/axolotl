@@ -841,6 +841,12 @@ class ModelLoader:
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                     LOG.info("All ranks synchronized after model load (%.1fs total)", _time.time() - _t0)
+            else:
+                # ZeRO-2 / non-ZeRO-3 path: load model normally
+                if self.cfg.reinit_weights:
+                    self.model = self._load_model_from_config(model_loader_class)
+                else:
+                    self.model = self._load_model_from_pretrained(model_loader_class)
 
         if is_deepspeed_zero3_enabled():
             skip_move_to_device = True
