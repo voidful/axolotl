@@ -826,33 +826,21 @@ class ModelLoader:
             if is_zero3:
                 import deepspeed
                 import time as _time
-                import fcntl
                 local_rank = int(os.getenv("LOCAL_RANK", "0"))
-                local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
 
                 _t0 = _time.time()
-                LOG.info("Starting ZeRO-3 model init (local_rank=%d, local_world_size=%d)...", local_rank, local_world_size)
+                LOG.info("Starting ZeRO-3 model init (local_rank=%d)...", local_rank)
                 with deepspeed.zero.Init():
                     if self.cfg.reinit_weights:
                         self.model = self._load_model_from_config(model_loader_class)
                     else:
-                        # Serialize model loading within each node using file lock.
-                        # This avoids collective new_group() calls that stall at large scale.
-                        lock_file = f"/tmp/axolotl_model_load_{os.getenv('SLURM_JOB_ID', 'default')}.lock"
-                        LOG.info(f"Acquiring node-local lock for model loading (local_rank {local_rank})...")
-                        with open(lock_file, "w") as lf:
-                            fcntl.flock(lf, fcntl.LOCK_EX)
-                            try:
-                                LOG.info(f"Loading ZeRO-3 model on local_rank {local_rank}...")
-                                _t1 = _time.time()
-                                self.model = self._load_model_from_pretrained(model_loader_class)
-                                LOG.info(f"ZeRO-3 model loaded on local_rank {local_rank} in {_time.time()-_t1:.1f}s")
-                            finally:
-                                fcntl.flock(lf, fcntl.LOCK_UN)
-                LOG.info("ZeRO-3 init complete in %.1fs", _time.time() - _t0)
-                # Global barrier to ensure all nodes finished before proceeding
+                        LOG.info(f"Loading ZeRO-3 model on local_rank {local_rank}...")
+                        self.model = self._load_model_from_pretrained(model_loader_class)
+                LOG.info("ZeRO-3 model loaded in %.1fs (local_rank=%d)", _time.time() - _t0, local_rank)
+                # Global barrier to ensure all ranks finished before proceeding
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
+                    LOG.info("All ranks synchronized after model load (%.1fs total)", _time.time() - _t0)
 
         if is_deepspeed_zero3_enabled():
             skip_move_to_device = True
