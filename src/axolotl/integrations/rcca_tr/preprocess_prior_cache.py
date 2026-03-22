@@ -235,8 +235,16 @@ def main():
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
     print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
     import torch.distributed as dist
-    if dist.is_initialized():
-        dist.barrier()
+    import datetime
+    
+    # Actually initialize the distributed group so the barrier works!
+    # A generous timeout of 4 hours because the 240 GPUs staggered at 3s + Local locking take ~10-15 minutes to all clear the gate.
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            timeout=datetime.timedelta(hours=4)
+        )
+    dist.barrier()
 
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
 
