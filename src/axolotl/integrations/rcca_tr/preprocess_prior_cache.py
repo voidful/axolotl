@@ -211,35 +211,36 @@ def main():
     # safetensors.safe_open() uses mmap() by default, which permanently reserves ~54GB
     # of Virtual Address Space (VAS) per process for the entire lifetime of the model.
     # With 8 GPU processes per node, that's 432GB VAS from mmap alone, plus ~100GB per
-    # CUDA context, Python overhead, etc. This exceeds the OS/cgroup VAS limit and
-    # causes "Cannot allocate memory (12)" on the 2nd or 3rd process.
+    # CUDA context, Python overhead, etc. This exceeds the OS/cgroup VAS limit.
     #
-    # By forcing use_mmap=False, safetensors reads files via normal read() syscalls.
-    # The data is copied to CPU RAM temporarily, weights are moved to GPU, and the
-    # CPU buffer is freed — releasing ALL Virtual Address Space immediately.
+    # By forcing use_mmap=False, safetensors reads files via normal read() syscalls,
+    # freeing ALL Virtual Address Space immediately after weights move to GPU.
     # ==================================================================================
-    import safetensors.safetensors_rust
-    _original_safe_open = safetensors.safetensors_rust.safe_open
+    import safetensors
+    from safetensors import safe_open as _original_safe_open
     
-    class _SafeOpenNoMmap:
-        """Wrapper that forces use_mmap=False on safetensors.safe_open."""
-        def __init__(self, *args, **kwargs):
-            kwargs["use_mmap"] = False
-            self._delegate = _original_safe_open(*args, **kwargs)
-        def __getattr__(self, name):
-            return getattr(self._delegate, name)
-        def __enter__(self):
-            return self._delegate.__enter__()
-        def __exit__(self, *args):
-            return self._delegate.__exit__(*args)
-        def keys(self):
-            return self._delegate.keys()
-        def get_tensor(self, name):
-            return self._delegate.get_tensor(name)
-        def get_slice(self, name):
-            return self._delegate.get_slice(name)
+    def _safe_open_no_mmap(*args, **kwargs):
+        kwargs["use_mmap"] = False
+        return _original_safe_open(*args, **kwargs)
     
-    safetensors.safetensors_rust.safe_open = _SafeOpenNoMmap
+    # Patch every location where transformers could find safe_open
+    safetensors.safe_open = _safe_open_no_mmap
+    try:
+        import safetensors.safetensors_rust
+        safetensors.safetensors_rust.safe_open = _safe_open_no_mmap
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    try:
+        import safetensors._safetensors_rust
+        safetensors._safetensors_rust.safe_open = _safe_open_no_mmap
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    try:
+        import safetensors.torch
+        if hasattr(safetensors.torch, 'safe_open'):
+            safetensors.torch.safe_open = _safe_open_no_mmap
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
     print(f"[Rank {rank}] Monkey-patched safetensors to disable mmap (use_mmap=False)")
     
     # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
