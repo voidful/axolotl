@@ -188,7 +188,7 @@ def main():
     pass
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=False)
 
     # Apply custom chat template if specified
     custom_template = None
@@ -222,7 +222,9 @@ def main():
             device_map={"": local_rank},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=False
+            local_files_only=False,
+            low_cpu_mem_usage=True,
+            use_safetensors=False
         )
         model.eval()
         import gc
