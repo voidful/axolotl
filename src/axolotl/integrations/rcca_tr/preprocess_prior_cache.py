@@ -179,33 +179,12 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1"))) 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 
-    # --- HPC NFS DDoS Bypass ---
-    # Copy model to local NVMe scratch to prevent NFS mmap crashes across 30 nodes
-    scratch_dir = os.environ.get("LOCAL_SCRATCH", os.environ.get("SLURM_TMPDIR", "/tmp"))
-    local_model_path = os.path.join(scratch_dir, f"hf_cache_{args.base_model.replace('/', '_')}")
-    
-    if local_rank == 0:
-        if not os.path.exists(os.path.join(local_model_path, ".ready")):
-            import shutil
-            from huggingface_hub import snapshot_download
-            try:
-                actual_model_path = snapshot_download(args.base_model, local_files_only=True)
-            except Exception:
-                actual_model_path = args.base_model
-                
-            print(f"[Node Rank 0] Copying model from NFS ({actual_model_path}) to local scratch ({local_model_path}) to prevent NFS mmap collapse...")
-            shutil.copytree(actual_model_path, local_model_path, symlinks=False, dirs_exist_ok=True)
-            with open(os.path.join(local_model_path, ".ready"), "w") as f:
-                f.write("ready")
-            print("[Node Rank 0] Copy complete!")
-
-    import time
-    while not os.path.exists(os.path.join(local_model_path, ".ready")):
-        time.sleep(2)
-        
-    # Override base_model to point to the local NVMe copy
-    args.base_model = local_model_path
-    # ---------------------------
+    # --- HPC NFS DDoS Bypass Removed ---
+    # We no longer copy to `/tmp` because `/tmp` is typically a RAM-backed tmpfs on SLURM, 
+    # and copying a 54GB model into it instantly exhausts 54GB of Physical RAM before inference even starts!
+    # Instead, our sequential staggered loading (implemented below) sufficiently protects the NFS from DDoS
+    # without sacrificing Node Virtual Memory.
+    pass
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=True)
@@ -229,7 +208,7 @@ def main():
     # By forcing them to load one by one, we keep the peak VM at 54GB instead of 54GB * 8 = 432GB (which crashes).
     job_id = os.environ.get("SLURM_JOB_ID", "local_run")
     if local_rank > 0:
-        prev_flag = os.path.join(args.base_model, f".loaded_{job_id}_{local_rank-1}")
+        prev_flag = os.path.join("/tmp", f".loaded_{job_id}_{local_rank-1}")
         print(f"[Rank {rank}] Waiting for local_rank {local_rank-1} to finish loading to save VM...")
         while not os.path.exists(prev_flag):
             import time
@@ -246,13 +225,11 @@ def main():
     )
     model.eval()
 
-    model.eval()
-    
     import gc
     gc.collect() # Force garbage collect the mmap file handles to free VM
 
     # Signal next local process that it is safe to load its own copy
-    with open(os.path.join(args.base_model, f".loaded_{job_id}_{local_rank}"), "w") as f:
+    with open(os.path.join("/tmp", f".loaded_{job_id}_{local_rank}"), "w") as f:
         f.write("loaded")
 
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
