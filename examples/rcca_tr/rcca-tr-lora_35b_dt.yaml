@@ -134,12 +134,14 @@ chat_template_jinja: >-
       {%- endif %}
   {%- endif %}
 
-sequence_len: 16384
-sample_packing: true
-pad_to_sequence_len: true
+sequence_len: 8192
+sample_packing: false
+pad_to_sequence_len: false
 
-gradient_accumulation_steps: 4
-micro_batch_size: 1
+gradient_accumulation_steps: 2
+micro_batch_size: 2
+batch_flattening: true
+group_by_length: true
 num_epochs: 3
 optimizer: adamw_torch_fused
 lr_scheduler: cosine
@@ -148,7 +150,7 @@ learning_rate: 2e-5
 bf16: true
 gradient_checkpointing: true
 flash_attention: true
-dataloader_num_workers: 0
+dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
 output_dir: ./outputs/rcca-tr-fft
