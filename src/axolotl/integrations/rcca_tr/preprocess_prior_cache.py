@@ -227,10 +227,6 @@ def main():
     import gc
     gc.collect() # Force garbage collect the mmap file handles to free VM
 
-    # Signal next local process that it is safe to load its own copy
-    with open(os.path.join("/tmp", f".loaded_{job_id}_{local_rank}"), "w") as f:
-        f.write("loaded")
-
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
     print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
     import torch.distributed as dist
