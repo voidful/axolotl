@@ -235,40 +235,24 @@ def compute_and_broadcast(fn):
 
 
 def gather_from_all_ranks(fn, world_size=1):
-    """
-    Run a callable 'fn' on all ranks and gather the results on the specified rank.
-
-    Args:
-    - fn (callable): A function that computes the value. This should not have any side effects.
-    - rank (int, optional): The rank that gathers the values. Default is 0.
-    - world_size (int, optional): Total number of processes in the current distributed setup.
-
-    Returns:
-    - A list of computed values from all ranks if on the gathering rank, otherwise None.
-    """
+    \"""
+    Run a callable 'fn' on all ranks and all-gather the results.
+    \"""
     value_scalar = fn()
     value_tensor = torch.tensor(
         value_scalar, device=f"{get_device_type()}:{get_current_device()}"
     ).float()
 
-    # Placeholder tensor for gathering results
-    if is_main_process():
-        gathered_tensors = [torch.zeros_like(value_tensor) for _ in range(world_size)]
-    else:
-        gathered_tensors = None
+    gathered_tensors = [torch.zeros_like(value_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, value_tensor)
 
-    dist.gather(value_tensor, gather_list=gathered_tensors, dst=0)
-
-    if is_main_process():
-        # Convert tensors back to their original type (int or float)
-        gathered_values = []
-        for tensor in gathered_tensors:
-            if tensor == tensor.int():
-                gathered_values.append(int(tensor.item()))
-            else:
-                gathered_values.append(float(tensor.item()))
-        return gathered_values
-    return None
+    gathered_values = []
+    for tensor in gathered_tensors:
+        if tensor == tensor.int():
+            gathered_values.append(int(tensor.item()))
+        else:
+            gathered_values.append(float(tensor.item()))
+    return gathered_values
 
 
 def reduce_and_broadcast(fn1, fn2):
