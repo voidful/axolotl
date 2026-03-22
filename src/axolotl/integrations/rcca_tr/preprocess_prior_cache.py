@@ -201,31 +201,36 @@ def main():
     elif args.chat_template_jinja:
         custom_template = args.chat_template_jinja
 
-    if custom_template:
-        tokenizer.chat_template = custom_template
-
-    # Implement 2D Mathematical Staggering:
-    # 1. `local_rank * 35`: Forces GPUs on the SAME node to wait 35s for the previous GPU to finish 54GB `mmap` load to prevent OS ENOMEM panic.
-    # 2. `node_rank * 3`: Trickles the 30 nodes so they don't DDoS the Lustre NFS metadata server simultaneously.
-    node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
-    sleep_time = (local_rank * 35) + (node_rank * 3)
-    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Sleeping {sleep_time}s to serialize Local VM and trickle Lustre NFS...")
     import time
-    time.sleep(sleep_time)
-
+    import fcntl
     
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        torch_dtype=torch.bfloat16,
-        device_map={"": local_rank},
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-        local_files_only=True
-    )
-    model.eval()
+    # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
+    node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
+    if local_rank == 0:
+        time.sleep(node_rank * 3)
+    
+    # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations 
+    # for the 54GB safetensor mmaps, gracefully queueing up all 8 GPUs locally without timing guesswork.
+    lock_path = f"/tmp/hf_model_load_lock_{os.environ.get('SLURM_JOB_ID', 'local')}.lock"
+    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Waiting for Node lock {lock_path} to guarantee exclusive Local VM mmap...")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Acquired lock! Strictly loading model {args.base_model} on cuda:{local_rank} safely...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=torch.bfloat16,
+            device_map={"": local_rank},
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+            local_files_only=True
+        )
+        model.eval()
 
-    import gc
-    gc.collect() # Force garbage collect the mmap file handles to free VM
+        import gc
+        gc.collect() # Force garbage collect the mmap file handles to free VM
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    print(f"[Rank {rank}/{world_size}] Successfully loaded model and released VM lock!")
 
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
     print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
