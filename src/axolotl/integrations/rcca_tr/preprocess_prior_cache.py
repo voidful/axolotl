@@ -205,18 +205,54 @@ def main():
     import time
     import fcntl
     
+    # ==================================================================================
+    # CRITICAL FIX: Disable safetensors mmap to prevent Virtual Address Space exhaustion.
+    # 
+    # safetensors.safe_open() uses mmap() by default, which permanently reserves ~54GB
+    # of Virtual Address Space (VAS) per process for the entire lifetime of the model.
+    # With 8 GPU processes per node, that's 432GB VAS from mmap alone, plus ~100GB per
+    # CUDA context, Python overhead, etc. This exceeds the OS/cgroup VAS limit and
+    # causes "Cannot allocate memory (12)" on the 2nd or 3rd process.
+    #
+    # By forcing use_mmap=False, safetensors reads files via normal read() syscalls.
+    # The data is copied to CPU RAM temporarily, weights are moved to GPU, and the
+    # CPU buffer is freed — releasing ALL Virtual Address Space immediately.
+    # ==================================================================================
+    import safetensors.safetensors_rust
+    _original_safe_open = safetensors.safetensors_rust.safe_open
+    
+    class _SafeOpenNoMmap:
+        """Wrapper that forces use_mmap=False on safetensors.safe_open."""
+        def __init__(self, *args, **kwargs):
+            kwargs["use_mmap"] = False
+            self._delegate = _original_safe_open(*args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self._delegate, name)
+        def __enter__(self):
+            return self._delegate.__enter__()
+        def __exit__(self, *args):
+            return self._delegate.__exit__(*args)
+        def keys(self):
+            return self._delegate.keys()
+        def get_tensor(self, name):
+            return self._delegate.get_tensor(name)
+        def get_slice(self, name):
+            return self._delegate.get_slice(name)
+    
+    safetensors.safetensors_rust.safe_open = _SafeOpenNoMmap
+    print(f"[Rank {rank}] Monkey-patched safetensors to disable mmap (use_mmap=False)")
+    
     # 1. Trickle Lustre Cluster Load: nodes stagger strictly by 3 seconds.
     # EVERY GPU on the node must wait, otherwise local_rank=1 rushes the lock and 40 nodes hit NFS simultaneously at T=0!
     node_rank = rank // (world_size // int(os.environ.get("NNODES", "30")) if "NNODES" in os.environ else 8)
     time.sleep(node_rank * 3)
     
-    # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations 
-    # for the 54GB safetensor mmaps, gracefully queueing up all 8 GPUs locally without timing guesswork.
+    # 2. Strict Serialization Local Load: OS-level lock on each node guarantees NO overlap of VM allocations.
     lock_path = f"/tmp/hf_model_load_lock_{os.environ.get('SLURM_JOB_ID', 'local')}.lock"
-    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Waiting for Node lock {lock_path} to guarantee exclusive Local VM mmap...")
+    print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Waiting for Node lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Acquired lock! Strictly loading model {args.base_model} on cuda:{local_rank} safely...")
+        print(f"[Rank {rank}/{world_size} | Node {node_rank} Local {local_rank}] Acquired lock! Loading model {args.base_model} on cuda:{local_rank} (mmap DISABLED)...")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
@@ -228,10 +264,10 @@ def main():
         model.eval()
 
         import gc
-        gc.collect() # Force garbage collect the mmap file handles to free VM
+        gc.collect()
         fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    print(f"[Rank {rank}/{world_size}] Successfully loaded model and released VM lock!")
+    print(f"[Rank {rank}/{world_size}] Successfully loaded model and released lock!")
 
     # [CRITICAL] Prevent early ranks from starting intensive inference while later ranks are still mapping Safetensors!
     print(f"[Rank {rank}] Waiting for all other ranks across all nodes to finish loading weights...")
