@@ -841,10 +841,6 @@ class ModelLoader:
                                 torch.distributed.barrier()
                         else:
                             self.model = self._load_model_from_pretrained(model_loader_class)
-                if self.cfg.reinit_weights:
-                    self.model = self._load_model_from_config(model_loader_class)
-                else:
-                    self.model = self._load_model_from_pretrained(model_loader_class)
 
         if is_deepspeed_zero3_enabled():
             skip_move_to_device = True

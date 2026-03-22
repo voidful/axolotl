@@ -109,62 +109,73 @@ class RCCATRPlugin(BasePlugin):
         mtime = os.path.getmtime(cache_path)
         fingerprint = hashlib.md5(f"rcca_tr_prior_{cache_path}_{mtime}".encode()).hexdigest()
 
+        # Use shared filesystem path (same parent as cache_path) — NOT /tmp/ which is node-local
+        shared_dataset_dir = os.path.join(os.path.dirname(cache_path) or ".", f"rcca_tr_dataset_{fingerprint}")
+
         if is_main_process:
             import time
             t0 = time.time()
-            LOG.info("Loading prior cache from %s", cache_path)
-            cache = torch.load(cache_path, weights_only=True)
-            num_cache_samples = len(cache["prior_target_logp"])
-            num_dataset_samples = len(trainer.train_dataset)
-            LOG.info("Prior cache loaded: %d samples (dataset: %d samples) in %.1fs", 
-                     num_cache_samples, num_dataset_samples, time.time() - t0)
 
-            # Convert tensors to Python lists up-front (avoids repeated .tolist() calls)
-            t1 = time.time()
-            prior_logp_lists = [t.tolist() for t in cache["prior_target_logp"]]
-            prior_margin_lists = [t.tolist() for t in cache["prior_margin"]]
-            del cache
-            LOG.info("Tensor to list conversion done in %.1fs", time.time() - t1)
+            # Check if we already saved a processed dataset from a previous run
+            if os.path.exists(shared_dataset_dir):
+                LOG.info("Found pre-built dataset at %s, loading directly...", shared_dataset_dir)
+                from datasets import load_from_disk
+                trainer.train_dataset = load_from_disk(shared_dataset_dir)
+                LOG.info("Pre-built dataset loaded in %.1fs", time.time() - t0)
+            else:
+                LOG.info("Loading prior cache from %s", cache_path)
+                cache = torch.load(cache_path, weights_only=True)
+                num_cache_samples = len(cache["prior_target_logp"])
+                num_dataset_samples = len(trainer.train_dataset)
+                LOG.info("Prior cache loaded: %d samples (dataset: %d samples) in %.1fs", 
+                         num_cache_samples, num_dataset_samples, time.time() - t0)
 
-            # Build the columns: trim/pad each entry to match the tokenized sequence length
-            t2 = time.time()
-            logp_column = []
-            margin_column = []
-            for idx in range(num_dataset_samples):
-                seq_len = len(trainer.train_dataset[idx]["input_ids"])
-                if idx < num_cache_samples:
-                    logp = prior_logp_lists[idx][:seq_len]
-                    margin = prior_margin_lists[idx][:seq_len]
-                    if len(logp) < seq_len:
-                        logp += [0.0] * (seq_len - len(logp))
-                        margin += [0.0] * (seq_len - len(margin))
-                else:
-                    logp = [0.0] * seq_len
-                    margin = [0.0] * seq_len
-                logp_column.append(logp)
-                margin_column.append(margin)
-                if (idx + 1) % 10000 == 0:
-                    LOG.info("Prior injection progress: %d/%d samples (%.1fs)", 
-                             idx + 1, num_dataset_samples, time.time() - t2)
+                # Convert tensors to Python lists up-front (avoids repeated .tolist() calls)
+                t1 = time.time()
+                prior_logp_lists = [t.tolist() for t in cache["prior_target_logp"]]
+                prior_margin_lists = [t.tolist() for t in cache["prior_margin"]]
+                del cache
+                LOG.info("Tensor to list conversion done in %.1fs", time.time() - t1)
 
-            del prior_logp_lists, prior_margin_lists
-            LOG.info("Column building done: %d samples in %.1fs", num_dataset_samples, time.time() - t2)
+                # Build the columns: trim/pad each entry to match the tokenized sequence length
+                t2 = time.time()
+                logp_column = []
+                margin_column = []
+                for idx in range(num_dataset_samples):
+                    seq_len = len(trainer.train_dataset[idx]["input_ids"])
+                    if idx < num_cache_samples:
+                        logp = prior_logp_lists[idx][:seq_len]
+                        margin = prior_margin_lists[idx][:seq_len]
+                        if len(logp) < seq_len:
+                            logp += [0.0] * (seq_len - len(logp))
+                            margin += [0.0] * (seq_len - len(margin))
+                    else:
+                        logp = [0.0] * seq_len
+                        margin = [0.0] * seq_len
+                    logp_column.append(logp)
+                    margin_column.append(margin)
+                    if (idx + 1) % 10000 == 0:
+                        LOG.info("Prior injection progress: %d/%d samples (%.1fs)", 
+                                 idx + 1, num_dataset_samples, time.time() - t2)
 
-            # Use add_column which is much faster than .map()
-            t3 = time.time()
-            trainer.train_dataset = trainer.train_dataset.add_column("prior_target_logp", logp_column)
-            trainer.train_dataset = trainer.train_dataset.add_column("prior_margin", margin_column)
-            del logp_column, margin_column
+                del prior_logp_lists, prior_margin_lists
+                LOG.info("Column building done: %d samples in %.1fs", num_dataset_samples, time.time() - t2)
 
-            # Save with fingerprint so other ranks can load from cache
-            trainer.train_dataset.save_to_disk(f"/tmp/rcca_tr_dataset_{fingerprint}")
-            LOG.info("Prior cache injected and saved in %.1fs (total: %.1fs)", 
-                     time.time() - t3, time.time() - t0)
+                # Use add_column which is much faster than .map()
+                t3 = time.time()
+                trainer.train_dataset = trainer.train_dataset.add_column("prior_target_logp", logp_column)
+                trainer.train_dataset = trainer.train_dataset.add_column("prior_margin", margin_column)
+                del logp_column, margin_column
+
+                # Save to SHARED filesystem so other ranks can load
+                trainer.train_dataset.save_to_disk(shared_dataset_dir)
+                LOG.info("Prior cache injected and saved in %.1fs (total: %.1fs)", 
+                         time.time() - t3, time.time() - t0)
 
         if dist.is_initialized():
             dist.barrier()
 
         if not is_main_process:
             from datasets import load_from_disk
-            LOG.info("Loading injected dataset from shared cache...")
-            trainer.train_dataset = load_from_disk(f"/tmp/rcca_tr_dataset_{fingerprint}")
+            LOG.info("Loading injected dataset from shared path: %s", shared_dataset_dir)
+            trainer.train_dataset = load_from_disk(shared_dataset_dir)
