@@ -215,25 +215,29 @@ def main():
     print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        
-        # Bypass Lustre mmap bug by caching to RAM disk (/dev/shm)
-        shm_model_dir = f"/dev/shm/hf_model_{args.base_model.replace('/', '_')}"
-        if not os.path.exists(shm_model_dir):
-            import shutil
-            from huggingface_hub import snapshot_download
-            print(f"[Rank {rank}/{world_size} | Local {local_rank}] Copying model to RAM Disk {shm_model_dir} (bypassing Lustre mmap bug)...")
-            real_model_path = snapshot_download(args.base_model, local_files_only=False)
-            shutil.copytree(real_model_path, shm_model_dir)
-            print(f"[Rank {rank}/{world_size} | Local {local_rank}] Copy to RAM Disk completed!")
 
-        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading from RAM Disk on cuda:{local_rank}...")
+        # Raise per-process virtual memory limit (SLURM often sets this too low for 50GB mmap)
+        import resource
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            print(f"[Rank {rank}] Current RLIMIT_AS: soft={soft}, hard={hard}")
+            resource.setrlimit(resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+            print(f"[Rank {rank}] Raised RLIMIT_AS to unlimited")
+        except (ValueError, resource.error) as e:
+            print(f"[Rank {rank}] Could not raise RLIMIT_AS: {e}, trying RLIMIT_DATA...")
+            try:
+                resource.setrlimit(resource.RLIMIT_DATA, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+            except Exception:
+                pass
+
+        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
-            shm_model_dir,
+            args.base_model,
             torch_dtype=torch.bfloat16,
             device_map={"": local_rank},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=True,
+            local_files_only=False,
             low_cpu_mem_usage=True,
         )
         model.eval()
