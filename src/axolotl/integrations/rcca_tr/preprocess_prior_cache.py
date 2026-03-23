@@ -35,26 +35,6 @@ import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# ── Lustre mmap fix ──────────────────────────────────────────────────────
-# Lustre filesystems do NOT support mmap. safetensors uses mmap by default.
-# DeepSpeed ZeRO-3 only partitions parameter memory, it does NOT change 
-# how weight files are read from disk. So we must disable mmap in safetensors.
-# This uses the official safetensors API (mmap=False, available in >= 0.5).
-from safetensors import safe_open as _original_safe_open
-
-def _safe_open_no_mmap(filename, framework="pt", device="cpu", **kwargs):
-    kwargs["mmap"] = False
-    return _original_safe_open(filename, framework=framework, device=device, **kwargs)
-
-import safetensors
-safetensors.safe_open = _safe_open_no_mmap
-
-# transformers caches its own local reference to safe_open at import time,
-# so we must patch that binding too.
-import transformers.modeling_utils
-transformers.modeling_utils.safe_open = _safe_open_no_mmap
-# ─────────────────────────────────────────────────────────────────────────
-
 import argparse
 from pathlib import Path
 
@@ -262,6 +242,46 @@ def main():
         dist.barrier()
         
     print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
+    
+    # -------------------------------------------------------------------------
+    # Lustre mmap Bypass Patch
+    # -------------------------------------------------------------------------
+    # Even with ZeRO-3, `transformers` uses `safetensors.safe_open` to read
+    # the 5GB state dict shards into RAM before ZeRO-3 partitions them.
+    # `safetensors` rigidly uses `mmap`. On Lustre, concurrent `mmap` of 
+    # large files often fails with "Cannot allocate memory" (ENOMEM).
+    # To bypass this without dealing with PyTorch C++ layout bugs, we temporarily 
+    # copy the file to the local RAM disk (`/tmp`), mmap it from there (which 
+    # never fails on Linux tmpfs), and then let the OS automatically GC the file 
+    # when the fd closes.
+    import safetensors
+    import tempfile
+    import shutil
+    
+    _orig_safe_open = safetensors.safe_open
+    
+    class TmpSafeOpen:
+        def __init__(self, filename, framework="pt", device="cpu"):
+            fd, tmp_path = tempfile.mkstemp(prefix="st_", dir="/tmp")
+            os.close(fd)
+            # This is fast: memory-to-memory copy from Lustre to local RAM disk
+            shutil.copy2(filename, tmp_path)
+            # Safe_open on local tmpfs works flawlessly
+            self.f = _orig_safe_open(tmp_path, framework=framework, device=device)
+            self.keys = self.f.keys
+            self.get_tensor = self.f.get_tensor
+            self.get_slice = self.f.get_slice
+            # Mark file for deletion immediately. It stays alive in OS until self.f is garbage collected.
+            os.unlink(tmp_path)
+            
+        def __enter__(self):
+            return self
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+            
+    safetensors.safe_open = TmpSafeOpen
+    # -------------------------------------------------------------------------
     
     # Force DeepSpeed ZeRO-3 partitioned loading manually
     # Since this is a standalone script, we must initialize the zero.Init context explicitly
