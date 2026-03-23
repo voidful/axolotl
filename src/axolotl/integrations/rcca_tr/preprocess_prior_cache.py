@@ -213,6 +213,25 @@ def main():
     # We rely on Accelerate / DeepSpeed zero-3 for memory-efficient loading.
     # When zero-3 is enabled, transformers automatically uses deepspeed.zero.Init()
     # to partition the model across GPUs WITHOUT loading the full 50GB into CPU RAM.
+    # Add a barrier to ensure only Rank 0 pulls HuggingFace files to cache first to avoid race conditions 
+    import torch.distributed as dist
+    import datetime
+    
+    # Initialize basic gloo process group just for this barrier if not initialized
+    if dist.is_available() and not dist.is_initialized():
+         dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=4))
+         
+    if rank == 0:
+        print(f"[Rank 0] Ensuring model files are cached before other ranks start...")
+        from transformers.utils.hub import cached_file
+        # AutoModelForCausalLM.from_pretrained on Rank 0 with device_map="cpu" would OOM, 
+        # so we just let tokenizer fetch whatever it needs (it does already), and model files 
+        # will be handled by ZeRO-3 later, but we can do a simple config/index pull
+        AutoConfig.from_pretrained(args.base_model, trust_remote_code=True)
+    
+    if dist.is_initialized():
+        dist.barrier()
+        
     print(f"[Rank {rank}/{world_size}] Loading {args.base_model} using Accelerate/DeepSpeed...")
     
     # Force DeepSpeed ZeRO-3 partitioned loading manually
