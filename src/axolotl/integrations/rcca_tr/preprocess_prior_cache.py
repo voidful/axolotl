@@ -185,7 +185,6 @@ def main():
     pass
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True, local_files_only=False)
 
     # Apply custom chat template if specified
     custom_template = None
@@ -218,19 +217,23 @@ def main():
     if dist.is_available() and not dist.is_initialized():
          dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=4))
          
-    if rank == 0:
-        print(f"[Rank 0] Ensuring model files are cached before other ranks start...")
-        from transformers.utils.hub import cached_file
-        from huggingface_hub import snapshot_download
-        # AutoModelForCausalLM.from_pretrained on Rank 0 with device_map="cpu" would OOM, 
-        # so we just let tokenizer fetch whatever it needs (it does already), and model files 
-        # will be handled by ZeRO-3 later. However, we must explicitly pull down the cache here.
-        # snapshot_download gets all safetensors/json files safely beforehand
-        print(f"[Rank 0] Running snapshot_download explicitly to prevent race condition...")
-        snapshot_download(repo_id=args.base_model, allow_patterns=["*.json", "*.safetensors", "*.model", "*.bin", "*.txt"], max_workers=2)
-        print(f"[Rank 0] snapshot_download finished. Releasing barrier!")
     
-    # Now that files are cached, set offline mode for all ranks to avoid further network calls
+    # Every rank calls snapshot_download independently.
+    # huggingface_hub handles file locking internally, so concurrent calls are safe.
+    # This ensures each node has the files in its local HF cache before loading.
+    from huggingface_hub import snapshot_download
+    print(f"[Rank {rank}] Downloading/verifying model files via snapshot_download...")
+    local_model_path = snapshot_download(
+        repo_id=args.base_model,
+        allow_patterns=["*.json", "*.safetensors", "*.model", "*.bin", "*.txt"],
+        max_workers=1,  # conservative to avoid Lustre overload
+    )
+    print(f"[Rank {rank}] Model files ready at: {local_model_path}")
+    
+    # Load tokenizer from the local path to avoid any HF Hub resolution issues
+    tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True, local_files_only=True)
+    
+    # Now set offline mode to prevent any further network calls
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -238,7 +241,7 @@ def main():
     if dist.is_initialized():
         dist.barrier()
         
-    print(f"[Rank {rank}/{world_size}] Loading {args.base_model} using Accelerate/DeepSpeed...")
+    print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
     
     # Force DeepSpeed ZeRO-3 partitioned loading manually
     # Since this is a standalone script, we must initialize the zero.Init context explicitly
@@ -267,11 +270,11 @@ def main():
              
         with deepspeed.zero.Init(config_dict_or_path=ds_config, remote_device=None):
             model = AutoModelForCausalLM.from_pretrained(
-                args.base_model,
+                local_model_path,  # Use local path, NOT HF repo ID
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 attn_implementation="sdpa",
-                local_files_only=False,
+                local_files_only=True,  # Force local-only, no HF Hub resolution
                 low_cpu_mem_usage=True, # Critical for ZeRO-3
             )
         print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
@@ -279,12 +282,12 @@ def main():
         # Fallback to device_map if deepspeed is not installed
         print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
         model = AutoModelForCausalLM.from_pretrained(
-            args.base_model,
+            local_model_path,
             torch_dtype=torch.bfloat16,
             device_map={"": local_rank},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=False,
+            local_files_only=True,
             low_cpu_mem_usage=True,
         )
         model.eval()
