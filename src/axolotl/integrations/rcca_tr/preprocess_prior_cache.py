@@ -257,6 +257,7 @@ def main():
     import safetensors
     import tempfile
     import shutil
+    import transformers.modeling_utils
     
     _orig_safe_open = safetensors.safe_open
     
@@ -280,7 +281,12 @@ def main():
         def __exit__(self, exc_type, exc_val, exc_tb):
             pass
             
+    # CRITICAL: We must patch the reference that transformers actually uses!
+    # transformers imports it as `from safetensors import safe_open`, 
+    # so we must patch `transformers.modeling_utils.safe_open`
     safetensors.safe_open = TmpSafeOpen
+    transformers.modeling_utils.safe_open = TmpSafeOpen
+    print(f"[Rank {rank}] Applied TmpSafeOpen mmap patch successfully.")
     # -------------------------------------------------------------------------
     
     # Force DeepSpeed ZeRO-3 partitioned loading manually
