@@ -97,17 +97,18 @@ def compute_prior_logits_for_batch(
                     log_probs_chunk = F.log_softmax(logits_chunk.float(), dim=-1) # [1, C, V]
                     
                     # shift targets and masks
-                    labels_chunk = labels[global_b:global_b+1, i+1:i_end+1] # [1, C]
+                    chunk_dev = log_probs_chunk.device
+                    labels_chunk = labels[global_b:global_b+1, i+1:i_end+1].to(chunk_dev) # [1, C]
                     safe_labels_chunk = labels_chunk.clamp(min=0)
-                    valid_chunk = (labels_chunk != -100) & attention_mask[global_b:global_b+1, i:i_end].bool()
+                    valid_chunk = ((labels_chunk != -100) & attention_mask[global_b:global_b+1, i:i_end].to(chunk_dev).bool())
                     
                     target_lp = log_probs_chunk.gather(dim=-1, index=safe_labels_chunk.unsqueeze(-1)).squeeze(-1) # [1, C]
                     top1_lp = log_probs_chunk.max(dim=-1).values # [1, C]
                     
-                    shifted_target_logp[global_b:global_b+1, i:i_end] = target_lp * valid_chunk.float()
-                    shifted_top1_logp[global_b:global_b+1, i:i_end] = top1_lp * valid_chunk.float()
+                    shifted_target_logp[global_b:global_b+1, i:i_end] = (target_lp * valid_chunk.float()).to(shifted_target_logp.device)
+                    shifted_top1_logp[global_b:global_b+1, i:i_end] = (top1_lp * valid_chunk.float()).to(shifted_top1_logp.device)
                     
-                    del h_chunk, logits_chunk, log_probs_chunk
+                    del h_chunk, logits_chunk, log_probs_chunk, labels_chunk, safe_labels_chunk, valid_chunk, target_lp, top1_lp
             
             del base_outputs, hidden_states
             torch.cuda.empty_cache()
