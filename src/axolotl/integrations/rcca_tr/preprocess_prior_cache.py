@@ -35,6 +35,26 @@ import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# ── Lustre mmap fix ──────────────────────────────────────────────────────
+# Lustre filesystems do NOT support mmap. safetensors uses mmap by default.
+# DeepSpeed ZeRO-3 only partitions parameter memory, it does NOT change 
+# how weight files are read from disk. So we must disable mmap in safetensors.
+# This uses the official safetensors API (mmap=False, available in >= 0.5).
+from safetensors import safe_open as _original_safe_open
+
+def _safe_open_no_mmap(filename, framework="pt", device="cpu", **kwargs):
+    kwargs["mmap"] = False
+    return _original_safe_open(filename, framework=framework, device=device, **kwargs)
+
+import safetensors
+safetensors.safe_open = _safe_open_no_mmap
+
+# transformers caches its own local reference to safe_open at import time,
+# so we must patch that binding too.
+import transformers.modeling_utils
+transformers.modeling_utils.safe_open = _safe_open_no_mmap
+# ─────────────────────────────────────────────────────────────────────────
+
 import argparse
 from pathlib import Path
 
