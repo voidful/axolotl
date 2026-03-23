@@ -275,8 +275,10 @@ def main():
             self.device = device
             
             file_size = os.path.getsize(filename)
-            self._buffer = torch.empty(file_size, dtype=torch.uint8, device="cpu")
-            m_view = memoryview(self._buffer.numpy())
+            import numpy as np
+            self._np_buffer = np.empty(file_size, dtype=np.uint8)
+            m_view = memoryview(self._np_buffer)
+            self._buffer = torch.from_numpy(self._np_buffer)
             
             with open(self.filename, 'rb') as f:
                 bytes_read = 0
