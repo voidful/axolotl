@@ -222,33 +222,42 @@ def main():
         import safetensors
 
         class SafeOpenNoMmap:
-            """Drop-in replacement for safetensors.safe_open using regular file I/O."""
+            """Drop-in replacement for safetensors.safe_open using regular file I/O.
+            Thread-safe: each get_slice opens its own file handle for concurrent access."""
             def __init__(self, filename, framework="pt", device="cpu"):
                 self.device = device
-                self._file = open(filename, 'rb')
-                header_size = _struct.unpack('<Q', self._file.read(8))[0]
-                header_bytes = self._file.read(header_size)
+                self._filename = filename  # Store for per-slice file handles
+                with open(filename, 'rb') as f:
+                    header_size = _struct.unpack('<Q', f.read(8))[0]
+                    header_bytes = f.read(header_size)
                 self._header = _json.loads(header_bytes)
                 self._data_offset = 8 + header_size
                 self._metadata = self._header.pop('__metadata__', {})
-
-            def keys(self):
-                return list(self._header.keys())
-
-            def get_tensor(self, name):
-                info = self._header[name]
-                start, end = info['data_offsets']
-                self._file.seek(self._data_offset + start)
-                raw = self._file.read(end - start)
-                dtype_map = {
+                self._dtype_map = {
                     'F16': torch.float16, 'BF16': torch.bfloat16,
                     'F32': torch.float32, 'F64': torch.float64,
                     'I8': torch.int8, 'I16': torch.int16,
                     'I32': torch.int32, 'I64': torch.int64,
                     'U8': torch.uint8, 'BOOL': torch.bool,
                 }
-                t = torch.frombuffer(bytearray(raw), dtype=dtype_map[info['dtype']])
-                t = t.reshape(info['shape'])
+
+            def keys(self):
+                return list(self._header.keys())
+
+            def _read_tensor(self, name):
+                """Read a single tensor using its own file handle (thread-safe)."""
+                info = self._header[name]
+                start, end = info['data_offsets']
+                nbytes = end - start
+                buf = bytearray(nbytes)
+                with open(self._filename, 'rb') as f:
+                    f.seek(self._data_offset + start)
+                    f.readinto(buf)
+                t = torch.frombuffer(buf, dtype=self._dtype_map[info['dtype']])
+                return t.reshape(info['shape'])
+
+            def get_tensor(self, name):
+                t = self._read_tensor(name)
                 if self.device != "cpu":
                     t = t.to(self.device)
                 return t
@@ -256,27 +265,14 @@ def main():
             def get_slice(self, name):
                 """Return a lazy slice object that defers I/O until accessed."""
                 info = self._header[name]
-                file_ref = self._file
-                data_offset = self._data_offset
-                dtype_map = {
-                    'F16': torch.float16, 'BF16': torch.bfloat16,
-                    'F32': torch.float32, 'F64': torch.float64,
-                    'I8': torch.int8, 'I16': torch.int16,
-                    'I32': torch.int32, 'I64': torch.int64,
-                    'U8': torch.uint8, 'BOOL': torch.bool,
-                }
+                parent = self
                 class _LazyTensorSlice:
                     def __init__(self):
                         self._info = info
                         self._materialized = None
                     def _materialize(self):
                         if self._materialized is None:
-                            start, end = self._info['data_offsets']
-                            file_ref.seek(data_offset + start)
-                            raw = file_ref.read(end - start)
-                            self._materialized = torch.frombuffer(
-                                bytearray(raw), dtype=dtype_map[self._info['dtype']]
-                            ).reshape(self._info['shape'])
+                            self._materialized = parent._read_tensor(name)
                         return self._materialized
                     def __getitem__(self, idx):
                         return self._materialize()[idx]
@@ -294,11 +290,10 @@ def main():
                 return self
 
             def __exit__(self, *args):
-                self._file.close()
+                pass  # No persistent file handle to close
 
             def __del__(self):
-                if hasattr(self, '_file') and not self._file.closed:
-                    self._file.close()
+                pass  # No persistent file handle to close
 
         _original_safe_open = safetensors.safe_open
         safetensors.safe_open = SafeOpenNoMmap
