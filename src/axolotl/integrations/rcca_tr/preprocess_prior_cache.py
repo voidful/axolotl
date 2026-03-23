@@ -268,13 +268,16 @@ def main():
 
         _original_safe_open = safetensors.safe_open
         safetensors.safe_open = SafeOpenNoMmap
-        # Also patch the import location used by transformers
+        # CRITICAL: transformers does "from safetensors import safe_open" at import time,
+        # so we must patch the local binding in transformers.modeling_utils directly
+        import transformers.modeling_utils
+        transformers.modeling_utils.safe_open = SafeOpenNoMmap
         try:
             import safetensors.torch
             safetensors.torch.safe_open = SafeOpenNoMmap
         except Exception:
             pass
-        print(f"[Rank {rank}] Patched safetensors.safe_open to bypass mmap")
+        print(f"[Rank {rank}] Patched safetensors.safe_open AND transformers.modeling_utils.safe_open to bypass mmap")
 
         print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -289,6 +292,7 @@ def main():
 
         # Restore original safe_open
         safetensors.safe_open = _original_safe_open
+        transformers.modeling_utils.safe_open = _original_safe_open
         try:
             safetensors.torch.safe_open = _original_safe_open
         except Exception:
