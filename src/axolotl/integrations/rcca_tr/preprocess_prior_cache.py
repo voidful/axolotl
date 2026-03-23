@@ -215,99 +215,6 @@ def main():
     print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        # Monkey-patch safetensors to bypass mmap (kernel/cgroup refuses 50GB mmap)
-        # This reads tensors using regular file I/O instead
-        import json as _json
-        import struct as _struct
-        import safetensors
-
-        class SafeOpenNoMmap:
-            """Drop-in replacement for safetensors.safe_open using regular file I/O.
-            Thread-safe: each get_slice opens its own file handle for concurrent access."""
-            def __init__(self, filename, framework="pt", device="cpu"):
-                self.device = device
-                self._filename = filename  # Store for per-slice file handles
-                with open(filename, 'rb') as f:
-                    header_size = _struct.unpack('<Q', f.read(8))[0]
-                    header_bytes = f.read(header_size)
-                self._header = _json.loads(header_bytes)
-                self._data_offset = 8 + header_size
-                self._metadata = self._header.pop('__metadata__', {})
-                self._dtype_map = {
-                    'F16': torch.float16, 'BF16': torch.bfloat16,
-                    'F32': torch.float32, 'F64': torch.float64,
-                    'I8': torch.int8, 'I16': torch.int16,
-                    'I32': torch.int32, 'I64': torch.int64,
-                    'U8': torch.uint8, 'BOOL': torch.bool,
-                }
-
-            def keys(self):
-                return list(self._header.keys())
-
-            def _read_tensor(self, name):
-                """Read a single tensor using its own file handle (thread-safe)."""
-                info = self._header[name]
-                start, end = info['data_offsets']
-                nbytes = end - start
-                buf = bytearray(nbytes)
-                with open(self._filename, 'rb') as f:
-                    f.seek(self._data_offset + start)
-                    f.readinto(buf)
-                t = torch.frombuffer(buf, dtype=self._dtype_map[info['dtype']])
-                return t.reshape(info['shape'])
-
-            def get_tensor(self, name):
-                t = self._read_tensor(name)
-                if self.device != "cpu":
-                    t = t.to(self.device)
-                return t
-
-            def get_slice(self, name):
-                """Return a lazy slice object that defers I/O until accessed."""
-                info = self._header[name]
-                parent = self
-                class _LazyTensorSlice:
-                    def __init__(self):
-                        self._info = info
-                        self._materialized = None
-                    def _materialize(self):
-                        if self._materialized is None:
-                            self._materialized = parent._read_tensor(name)
-                        return self._materialized
-                    def __getitem__(self, idx):
-                        return self._materialize()[idx]
-                    def get_shape(self):
-                        return list(self._info['shape'])
-                    @property
-                    def shape(self):
-                        return self._info['shape']
-                return _LazyTensorSlice()
-
-            def metadata(self):
-                return self._metadata
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass  # No persistent file handle to close
-
-            def __del__(self):
-                pass  # No persistent file handle to close
-
-        _original_safe_open = safetensors.safe_open
-        safetensors.safe_open = SafeOpenNoMmap
-        # CRITICAL: transformers does "from safetensors import safe_open" at import time,
-        # so we must patch the local binding in transformers.modeling_utils directly
-        import transformers.modeling_utils
-        transformers.modeling_utils.safe_open = SafeOpenNoMmap
-        try:
-            import safetensors.torch
-            safetensors.torch.safe_open = SafeOpenNoMmap
-        except Exception:
-            pass
-        print(f"[Rank {rank}] Patched safetensors.safe_open AND transformers.modeling_utils.safe_open to bypass mmap")
-
         print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -318,14 +225,6 @@ def main():
             local_files_only=False,
             low_cpu_mem_usage=True,
         )
-
-        # Restore original safe_open
-        safetensors.safe_open = _original_safe_open
-        transformers.modeling_utils.safe_open = _original_safe_open
-        try:
-            safetensors.torch.safe_open = _original_safe_open
-        except Exception:
-            pass
         model.eval()
         import gc
         gc.collect()
