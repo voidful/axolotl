@@ -246,25 +246,25 @@ def main():
     print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
     
     # -------------------------------------------------------------------------
-    # Lustre/SLURM mmap Bypass Patch (Ultimate `SafeOpenRam` Version)
+    # Lustre/SLURM mmap Bypass Patch (Tensor Streamer `SafeOpenStreamer`)
     # -------------------------------------------------------------------------
-    # Lustre absolutely rejects 30-node concurrent `mmap` calls on the same 5GB 
-    # safetensor file (`Cannot allocate memory` / `ENOMEM`). 
-    # But allocating `torch.empty` for EVERY tensor causes 35GB+ Python Heap leaks
-    # dragging GC to its knees and blowing up the CGroup limits!
-    # 
-    # SOLUTION: Allocate exactly ONE `torch.empty(5GB)` matching the exact file size.
-    # Read the whole file strictly sequentially using `f.readinto()` (Hyper fast, 
-    # no Lustre locks). Then behave exactly like native safetensors: dole out 
-    # `view()` slices that point right into that giant contiguous buffer!
+    # Lustre rejects 30-node concurrent `mmap`. 
+    # Furthermore, allocating a contiguous 5GB `numpy.empty` RAM buffer fails 
+    # due to severe cluster Virtual Address Space (VMAS) limits.
+    # SOLUTION: Use `readinto()` but stream TENSOR-BY-TENSOR (max ~2.5GB for lm_head) 
+    # straight into Numpy `empty()`. Since DeepSpeed ZeRO-3 is removed, these buffers
+    # move immediately to VRAM via Accelerate and get properly GC'd. No memory blobs!
     
     import safetensors
     import transformers.modeling_utils
     import json
     import struct
     import torch
+    import threading
 
-    class SafeOpenRam:
+    _global_stream_lock = threading.Lock()
+
+    class SafeOpenStreamer:
         def __init__(self, filename, framework="pt", device="cpu"):
             import gc
             gc.collect()
@@ -273,28 +273,12 @@ def main():
 
             self.filename = filename
             self.device = device
-            
-            file_size = os.path.getsize(filename)
-            import numpy as np
-            self._np_buffer = np.empty(file_size, dtype=np.uint8)
-            m_view = memoryview(self._np_buffer)
-            self._buffer = torch.from_numpy(self._np_buffer)
-            
             with open(self.filename, 'rb') as f:
-                bytes_read = 0
-                while bytes_read < file_size:
-                    n = f.readinto(m_view[bytes_read:])
-                    if n == 0:
-                        raise EOFError(f"Unexpected EOF while streaming {filename}")
-                    bytes_read += n
-                    
-            header_size_bytes = self._buffer[:8].numpy().tobytes()
-            self.header_size = struct.unpack('<Q', header_size_bytes)[0]
-            
-            header_json_bytes = self._buffer[8:8+self.header_size].numpy().tobytes()
-            header_json = header_json_bytes.decode('utf-8')
-            self.metadata = json.loads(header_json)
-            
+                header_size_bytes = f.read(8)
+                self.header_size = struct.unpack('<Q', header_size_bytes)[0]
+                header_json = f.read(self.header_size).decode('utf-8')
+                self.metadata = json.loads(header_json)
+                
             self.data_offset = 8 + self.header_size
             self.tensor_keys = [k for k in self.metadata.keys() if k != '__metadata__']
             
@@ -313,12 +297,25 @@ def main():
                 "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool
             }
             dt = dtype_map[dtype_str]
-            start_idx = self.data_offset + offsets[0]
-            end_idx = self.data_offset + offsets[1]
+            byte_size = offsets[1] - offsets[0]
             
-            # Memory View, 0 overhead. Exactly like mmap.
-            t_slice = self._buffer[start_idx:end_idx]
-            return t_slice.view(dtype=dt).reshape(shape)
+            with _global_stream_lock:
+                import numpy as np
+                # Allocate exactly the size of ONE tensor, bypassing OS 5GB fragmentation
+                t_bytes_np = np.empty(byte_size, dtype=np.uint8)
+                m_view = memoryview(t_bytes_np)
+                
+                with open(self.filename, 'rb') as f:
+                    f.seek(self.data_offset + offsets[0])
+                    bytes_read = 0
+                    while bytes_read < byte_size:
+                        n = f.readinto(m_view[bytes_read:])
+                        if n == 0:
+                            raise EOFError(f"Unexpected EOF while streaming {key}")
+                        bytes_read += n
+                        
+                t_bytes = torch.from_numpy(t_bytes_np)
+                return t_bytes.view(dtype=dt).reshape(shape)
             
         def get_slice(self, key):
             class _SliceProxy:
@@ -334,64 +331,27 @@ def main():
             return self
             
         def __exit__(self, exc_type, exc_val, exc_tb):
-            self._buffer = None
             self.metadata = None
             self.tensor_keys = None
 
-    safetensors.safe_open = SafeOpenRam
-    transformers.modeling_utils.safe_open = SafeOpenRam
-    print(f"[Rank {rank}] Applied SafeOpenRam (Native MMap emulation via 5GB Block Read!)")
+    safetensors.safe_open = SafeOpenStreamer
+    transformers.modeling_utils.safe_open = SafeOpenStreamer
+    print(f"[Rank {rank}] Applied SafeOpenStreamer (Tensor-by-Tensor, 0 mmap, Minimal RAM)")
     # -------------------------------------------------------------------------
     
-    # Force DeepSpeed ZeRO-3 partitioned loading manually
-    # Since this is a standalone script, we must initialize the zero.Init context explicitly
-    try:
-        import deepspeed
-        from deepspeed.runtime.zero.partition_parameters import ZeroParamType
-        
-        print(f"[Rank {rank}] Forcing DeepSpeed ZeRO-3 Init context to partition model weights...")
-        
-        # Determine deepspeed config path from environment, or use default zero3
-        ds_config_path = os.environ.get("DEEPSPEED_CONFIG", "deepspeed_configs/zero3_custom.json")
-        if os.path.exists(ds_config_path):
-             import json
-             with open(ds_config_path, "r") as f:
-                 ds_config = json.load(f)
-             # DeepSpeed standalone Init() doesn't understand "auto"
-             if ds_config.get("train_micro_batch_size_per_gpu") == "auto":
-                 ds_config["train_micro_batch_size_per_gpu"] = 1
-             if ds_config.get("train_batch_size") == "auto":
-                 ds_config["train_batch_size"] = 1
-             if ds_config.get("gradient_accumulation_steps") == "auto":
-                 ds_config["gradient_accumulation_steps"] = 1
-        else:
-             # minimal inline config if file not found
-             ds_config = {"train_micro_batch_size_per_gpu": 1, "train_batch_size": 1, "zero_optimization": {"stage": 3}}
-             
-        with deepspeed.zero.Init(config_dict_or_path=ds_config, remote_device=None):
-            model = AutoModelForCausalLM.from_pretrained(
-                local_model_path,  # Use local path, NOT HF repo ID
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-                attn_implementation="sdpa",
-                local_files_only=True,  # Force local-only, no HF Hub resolution
-                low_cpu_mem_usage=True,  # Critical for ZeRO-3
-                ignore_mismatched_sizes=True,  # Prevent shape mismatch failures
-            )
-        print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
-    except ImportError:
-        # Fallback to device_map if deepspeed is not installed
-        print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
-        model = AutoModelForCausalLM.from_pretrained(
-            local_model_path,
-            torch_dtype=torch.bfloat16,
-            device_map={"": local_rank},
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-            local_files_only=True,
-            low_cpu_mem_usage=True,
-            ignore_mismatched_sizes=True,
-        )
+    # Generate prior cache via Single-Node Multi-GPU pipeline parallelism (Data Parallel across nodes)!
+    # This completely eliminates DeepSpeed ZeRO-3's cross-node NCCL communication bottlenecks.
+    print(f"[Rank {rank}/{world_size}] Using Accelerate device_map='auto' for maximum forward-pass speed...")
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        local_model_path,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+        ignore_mismatched_sizes=True,
+    )
     model.eval()
     import gc
     gc.collect()
