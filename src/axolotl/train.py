@@ -160,7 +160,7 @@ def setup_signal_handler(cfg: DictDefault, model: PreTrainedModel):
         def terminate_handler(_, __, model_weakref):
             if model_weakref() is not None:
                 _model = model_weakref()
-                _model.save_pretrained(cfg.output_dir)
+                _model.save_pretrained(cfg.output_dir, max_shard_size="5GB")
 
             cleanup_distributed()
             sys.exit(0)
@@ -333,9 +333,9 @@ def save_trained_model(
                 pass
     elif cfg.local_rank == 0:
         if cfg.rl and cfg.adapter and not cfg.rl_adapter_ref_model:
-            trainer.model.save_pretrained(cfg.output_dir)
+            trainer.model.save_pretrained(cfg.output_dir, max_shard_size="5GB")
 
-        model.save_pretrained(cfg.output_dir)
+        model.save_pretrained(cfg.output_dir, max_shard_size="5GB")
 
     if hasattr(cfg, "llmcompressor") and cfg.llmcompressor:
         # TODO: add integration support so this can be implemented completely within the plugin
@@ -481,7 +481,7 @@ def handle_untrained_tokens_fix(
     fix_untrained_tokens(model, tokenizer, train_dataset, **fix_kwargs)
 
     if cfg.local_rank == 0:
-        model.save_pretrained(str(Path(cfg.output_dir)))
+        model.save_pretrained(str(Path(cfg.output_dir)), max_shard_size="5GB")
 
 
 def setup_model_and_trainer(

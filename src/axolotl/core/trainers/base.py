@@ -754,6 +754,7 @@ class AxolotlTrainer(
                     output_dir,
                     state_dict=state_dict,
                     is_main_process=self.accelerator.is_main_process,
+                    max_shard_size="5GB",
                 )
             else:
                 LOG.info(
@@ -769,6 +770,7 @@ class AxolotlTrainer(
                 output_dir,
                 state_dict=state_dict,
                 is_main_process=self.accelerator.is_main_process,
+                max_shard_size="5GB",
             )
 
         if self.processing_class is not None:
