@@ -66,8 +66,6 @@ def compute_prior_logits_for_batch(
     """
     B, T = input_ids.shape
     
-    B, T = input_ids.shape
-    
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         shifted_target_logp = torch.zeros(B, T-1, device=input_ids.device)
         shifted_top1_logp = torch.zeros(B, T-1, device=input_ids.device)
@@ -172,9 +170,8 @@ def main():
         print(f"Merged {len(all_tgt)} samples to {args.output_path}.")
         return
 
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_DATASETS_OFFLINE"] = "1"
-    os.environ["HF_HUB_OFFLINE"] = "1"
+    # NOTE: Do NOT set OFFLINE envvars here!
+    # They must be set AFTER snapshot_download on Rank 0 so files can be fetched.
     
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1"))) 
@@ -224,11 +221,19 @@ def main():
     if rank == 0:
         print(f"[Rank 0] Ensuring model files are cached before other ranks start...")
         from transformers.utils.hub import cached_file
-        from transformers import AutoConfig
+        from huggingface_hub import snapshot_download
         # AutoModelForCausalLM.from_pretrained on Rank 0 with device_map="cpu" would OOM, 
         # so we just let tokenizer fetch whatever it needs (it does already), and model files 
-        # will be handled by ZeRO-3 later, but we can do a simple config/index pull
-        AutoConfig.from_pretrained(args.base_model, trust_remote_code=True)
+        # will be handled by ZeRO-3 later. However, we must explicitly pull down the cache here.
+        # snapshot_download gets all safetensors/json files safely beforehand
+        print(f"[Rank 0] Running snapshot_download explicitly to prevent race condition...")
+        snapshot_download(repo_id=args.base_model, allow_patterns=["*.json", "*.safetensors", "*.model", "*.bin", "*.txt"], max_workers=2)
+        print(f"[Rank 0] snapshot_download finished. Releasing barrier!")
+    
+    # Now that files are cached, set offline mode for all ranks to avoid further network calls
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
     
     if dist.is_initialized():
         dist.barrier()
@@ -285,7 +290,6 @@ def main():
         model.eval()
         import gc
         gc.collect()
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     print(f"[Rank {rank}/{world_size}] Model loaded successfully!")
 
