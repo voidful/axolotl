@@ -263,7 +263,6 @@ def main():
     import json
     import struct
     import torch
-    import os
 
     class SafeOpenRam:
         def __init__(self, filename, framework="pt", device="cpu"):
