@@ -293,7 +293,16 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
 
-    print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
+    # !!! CRITICAL FIX: BLIND ACCELERATE TO SLURM !!!
+    # Accelerate (used by device_map="auto") automatically detects SLURM_PROCID
+    # and tries to initialize a multi-node NCCL process group in the background.
+    # Since we want fully independent nodes, we MUST scrub these variables so 
+    # Accelerate treats each process as a completely standalone local run.
+    for key in list(os.environ.keys()):
+        if key.startswith("SLURM_") or key in ["RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"]:
+            del os.environ[key]
+
+    print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on node GPUs")
 
     # Apply custom chat template if specified
     custom_template = None
