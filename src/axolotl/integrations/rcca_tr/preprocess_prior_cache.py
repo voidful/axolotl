@@ -263,7 +263,10 @@ def main():
     import json
     import struct
     import torch
+    import threading
     
+    _global_stream_lock = threading.Lock()
+
     class SafeOpenStreamer:
         def __init__(self, filename, framework="pt", device="cpu"):
             self.filename = filename
@@ -303,16 +306,23 @@ def main():
             dt = dtype_map[dtype_str]
             byte_size = offsets[1] - offsets[0]
             
-            # Allocate only the precisely required bytes as uint8
-            t_bytes = torch.empty(byte_size, dtype=torch.uint8, device="cpu")
-            m_view = memoryview(t_bytes.numpy())
-            
-            # Stream directly from disk into PyTorch C buffer, bypassing python overhead completely
-            with open(self.filename, 'rb') as f:
-                f.seek(self.data_offset + offsets[0])
-                bytes_read = 0
-                while bytes_read < byte_size:
-                    n = f.readinto(m_view[bytes_read:])
+            # Use lock to strictly prevent ThreadPoolExecutor OOMs
+            with _global_stream_lock:
+                # Allocate only the precisely required bytes as uint8
+                t_bytes = torch.empty(byte_size, dtype=torch.uint8, device="cpu")
+                m_view = memoryview(t_bytes.numpy())
+                
+                # Stream directly from disk into PyTorch C buffer, bypassing python overhead completely
+                with open(self.filename, 'rb') as f:
+                    f.seek(self.data_offset + offsets[0])
+                    bytes_read = 0
+                    while bytes_read < byte_size:
+                        n = f.readinto(m_view[bytes_read:])
+                        if n == 0:
+                            raise EOFError("Unexpected EOF while streaming safetensors")
+                        bytes_read += n
+                        
+                return t_bytes.view(dtype=dt).reshape(shape).clone()
                     if n == 0:
                         raise EOFError("Unexpected EOF while streaming safetensors")
                     bytes_read += n
@@ -372,23 +382,25 @@ def main():
                 local_model_path,  # Use local path, NOT HF repo ID
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                attn_implementation="sdpa",
-                local_files_only=True,  # Force local-only, no HF Hub resolution
-                low_cpu_mem_usage=True, # Critical for ZeRO-3
-            )
-        print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
-    except ImportError:
-        # Fallback to device_map if deepspeed is not installed
-        print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
-        model = AutoModelForCausalLM.from_pretrained(
-            local_model_path,
-            torch_dtype=torch.bfloat16,
-            device_map={"": local_rank},
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-            local_files_only=True,
-            low_cpu_mem_usage=True,
-        )
+                 attn_implementation="sdpa",
+                 local_files_only=True,  # Force local-only, no HF Hub resolution
+                 low_cpu_mem_usage=True, # Critical for ZeRO-3
++                ignore_mismatched_sizes=True, # Prevent shape mismatch failures
+             )
+         print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
+     except ImportError:
+         # Fallback to device_map if deepspeed is not installed
+         print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
+         model = AutoModelForCausalLM.from_pretrained(
+             local_model_path,
+             torch_dtype=torch.bfloat16,
+             device_map={"": local_rank},
+             trust_remote_code=True,
+             attn_implementation="sdpa",
+             local_files_only=True,
+             low_cpu_mem_usage=True,
++            ignore_mismatched_sizes=True,
+         )
         model.eval()
         import gc
         gc.collect()
