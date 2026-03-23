@@ -233,13 +233,30 @@ def main():
             def keys(self): return list(self._header.keys())
             def metadata(self): return self._metadata
             def _read_tensor(self, name):
+                import ctypes
                 info = self._header[name]
                 s, e = info['data_offsets']
-                buf = bytearray(e - s)
+                nbytes = e - s
+                dtype = self._dtypes[info['dtype']]
+                # Calculate numel from shape
+                numel = 1
+                for d in info['shape']:
+                    numel *= d
+                # Allocate tensor via torch (uses system malloc, not Python heap)
+                t = torch.empty(numel, dtype=dtype)
+                ptr = t.data_ptr()
+                # Read file data in chunks directly into tensor memory
+                CHUNK = 64 * 1024 * 1024  # 64 MB
                 with open(self._filename, 'rb') as f:
                     f.seek(self._data_offset + s)
-                    f.readinto(buf)
-                return torch.frombuffer(buf, dtype=self._dtypes[info['dtype']]).reshape(info['shape'])
+                    offset = 0
+                    while offset < nbytes:
+                        chunk = f.read(min(CHUNK, nbytes - offset))
+                        if not chunk:
+                            break
+                        ctypes.memmove(ptr + offset, chunk, len(chunk))
+                        offset += len(chunk)
+                return t.reshape(info['shape'])
             def get_tensor(self, name):
                 t = self._read_tensor(name)
                 return t.to(self.device) if self.device != "cpu" else t
