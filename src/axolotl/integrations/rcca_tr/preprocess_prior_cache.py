@@ -245,6 +245,103 @@ def main():
     
     print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
     
+    # -------------------------------------------------------------------------
+    # Lustre/SLURM mmap Bypass Patch (Ultimate `SafeOpenRam` Version)
+    # -------------------------------------------------------------------------
+    # Lustre absolutely rejects 30-node concurrent `mmap` calls on the same 5GB 
+    # safetensor file (`Cannot allocate memory` / `ENOMEM`). 
+    # But allocating `torch.empty` for EVERY tensor causes 35GB+ Python Heap leaks
+    # dragging GC to its knees and blowing up the CGroup limits!
+    # 
+    # SOLUTION: Allocate exactly ONE `torch.empty(5GB)` matching the exact file size.
+    # Read the whole file strictly sequentially using `f.readinto()` (Hyper fast, 
+    # no Lustre locks). Then behave exactly like native safetensors: dole out 
+    # `view()` slices that point right into that giant contiguous buffer!
+    
+    import safetensors
+    import transformers.modeling_utils
+    import json
+    import struct
+    import torch
+    import os
+
+    class SafeOpenRam:
+        def __init__(self, filename, framework="pt", device="cpu"):
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            self.filename = filename
+            self.device = device
+            
+            file_size = os.path.getsize(filename)
+            self._buffer = torch.empty(file_size, dtype=torch.uint8, device="cpu")
+            m_view = memoryview(self._buffer.numpy())
+            
+            with open(self.filename, 'rb') as f:
+                bytes_read = 0
+                while bytes_read < file_size:
+                    n = f.readinto(m_view[bytes_read:])
+                    if n == 0:
+                        raise EOFError(f"Unexpected EOF while streaming {filename}")
+                    bytes_read += n
+                    
+            header_size_bytes = self._buffer[:8].numpy().tobytes()
+            self.header_size = struct.unpack('<Q', header_size_bytes)[0]
+            
+            header_json_bytes = self._buffer[8:8+self.header_size].numpy().tobytes()
+            header_json = header_json_bytes.decode('utf-8')
+            self.metadata = json.loads(header_json)
+            
+            self.data_offset = 8 + self.header_size
+            self.tensor_keys = [k for k in self.metadata.keys() if k != '__metadata__']
+            
+        def keys(self):
+            return self.tensor_keys
+            
+        def get_tensor(self, key):
+            info = self.metadata[key]
+            dtype_str = info['dtype']
+            shape = info['shape']
+            offsets = info['data_offsets']
+            
+            dtype_map = {
+                "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+                "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+                "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool
+            }
+            dt = dtype_map[dtype_str]
+            start_idx = self.data_offset + offsets[0]
+            end_idx = self.data_offset + offsets[1]
+            
+            # Memory View, 0 overhead. Exactly like mmap.
+            t_slice = self._buffer[start_idx:end_idx]
+            return t_slice.view(dtype=dt).reshape(shape)
+            
+        def get_slice(self, key):
+            class _SliceProxy:
+                def __init__(self, parent, key):
+                    self.parent = parent
+                    self.key = key
+                def __getitem__(self, idx):
+                    t = self.parent.get_tensor(self.key)
+                    return t[idx]
+            return _SliceProxy(self, key)
+            
+        def __enter__(self):
+            return self
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self._buffer = None
+            self.metadata = None
+            self.tensor_keys = None
+
+    safetensors.safe_open = SafeOpenRam
+    transformers.modeling_utils.safe_open = SafeOpenRam
+    print(f"[Rank {rank}] Applied SafeOpenRam (Native MMap emulation via 5GB Block Read!)")
+    # -------------------------------------------------------------------------
+    
     # Force DeepSpeed ZeRO-3 partitioned loading manually
     # Since this is a standalone script, we must initialize the zero.Init context explicitly
     try:
