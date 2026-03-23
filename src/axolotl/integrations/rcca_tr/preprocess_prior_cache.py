@@ -215,6 +215,55 @@ def main():
     print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        # Lustre doesn't support mmap — bypass with regular file I/O
+        import json as _json, struct as _struct, safetensors, transformers.modeling_utils
+        class SafeOpenNoMmap:
+            """Drop-in replacement for safetensors.safe_open using regular file I/O."""
+            def __init__(self, filename, framework="pt", device="cpu"):
+                self.device = device
+                self._filename = filename
+                with open(filename, 'rb') as f:
+                    hs = _struct.unpack('<Q', f.read(8))[0]
+                    self._header = _json.loads(f.read(hs))
+                self._data_offset = 8 + hs
+                self._metadata = self._header.pop('__metadata__', {})
+                self._dtypes = {'F16': torch.float16, 'BF16': torch.bfloat16, 'F32': torch.float32,
+                                'F64': torch.float64, 'I8': torch.int8, 'I16': torch.int16,
+                                'I32': torch.int32, 'I64': torch.int64, 'U8': torch.uint8, 'BOOL': torch.bool}
+            def keys(self): return list(self._header.keys())
+            def metadata(self): return self._metadata
+            def _read_tensor(self, name):
+                info = self._header[name]
+                s, e = info['data_offsets']
+                buf = bytearray(e - s)
+                with open(self._filename, 'rb') as f:
+                    f.seek(self._data_offset + s)
+                    f.readinto(buf)
+                return torch.frombuffer(buf, dtype=self._dtypes[info['dtype']]).reshape(info['shape'])
+            def get_tensor(self, name):
+                t = self._read_tensor(name)
+                return t.to(self.device) if self.device != "cpu" else t
+            def get_slice(self, name):
+                info, parent = self._header[name], self
+                class _S:
+                    def __init__(self): self._t = None
+                    def _m(self):
+                        if self._t is None: self._t = parent._read_tensor(name)
+                        return self._t
+                    def __getitem__(self, i): return self._m()[i]
+                    def get_shape(self): return list(info['shape'])
+                    @property
+                    def shape(self): return info['shape']
+                return _S()
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        safetensors.safe_open = SafeOpenNoMmap
+        transformers.modeling_utils.safe_open = SafeOpenNoMmap
+        try:
+            import safetensors.torch; safetensors.torch.safe_open = SafeOpenNoMmap
+        except Exception: pass
+        print(f"[Rank {rank}] Patched safetensors to bypass Lustre mmap")
+
         print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
