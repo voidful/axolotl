@@ -224,6 +224,7 @@ def main():
     if rank == 0:
         print(f"[Rank 0] Ensuring model files are cached before other ranks start...")
         from transformers.utils.hub import cached_file
+        from transformers import AutoConfig
         # AutoModelForCausalLM.from_pretrained on Rank 0 with device_map="cpu" would OOM, 
         # so we just let tokenizer fetch whatever it needs (it does already), and model files 
         # will be handled by ZeRO-3 later, but we can do a simple config/index pull
