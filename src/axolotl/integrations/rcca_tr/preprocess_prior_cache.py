@@ -220,7 +220,6 @@ def main():
         shm_model_dir = f"/dev/shm/hf_model_{args.base_model.replace('/', '_')}"
         if not os.path.exists(shm_model_dir):
             import shutil
-            import os
             from huggingface_hub import snapshot_download
             print(f"[Rank {rank}/{world_size} | Local {local_rank}] Copying model to RAM Disk {shm_model_dir} (bypassing Lustre mmap bug)...")
             real_model_path = snapshot_download(args.base_model, local_files_only=False)
