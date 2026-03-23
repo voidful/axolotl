@@ -254,16 +254,38 @@ def main():
                 return t
 
             def get_slice(self, name):
-                """Return a lazy slice object compatible with transformers' usage."""
-                tensor = self.get_tensor(name)
-                class _TensorSlice:
-                    def __init__(self, t):
-                        self._tensor = t
+                """Return a lazy slice object that defers I/O until accessed."""
+                info = self._header[name]
+                file_ref = self._file
+                data_offset = self._data_offset
+                dtype_map = {
+                    'F16': torch.float16, 'BF16': torch.bfloat16,
+                    'F32': torch.float32, 'F64': torch.float64,
+                    'I8': torch.int8, 'I16': torch.int16,
+                    'I32': torch.int32, 'I64': torch.int64,
+                    'U8': torch.uint8, 'BOOL': torch.bool,
+                }
+                class _LazyTensorSlice:
+                    def __init__(self):
+                        self._info = info
+                        self._materialized = None
+                    def _materialize(self):
+                        if self._materialized is None:
+                            start, end = self._info['data_offsets']
+                            file_ref.seek(data_offset + start)
+                            raw = file_ref.read(end - start)
+                            self._materialized = torch.frombuffer(
+                                bytearray(raw), dtype=dtype_map[self._info['dtype']]
+                            ).reshape(self._info['shape'])
+                        return self._materialized
                     def __getitem__(self, idx):
-                        return self._tensor[idx]
+                        return self._materialize()[idx]
                     def get_shape(self):
-                        return list(self._tensor.shape)
-                return _TensorSlice(tensor)
+                        return list(self._info['shape'])
+                    @property
+                    def shape(self):
+                        return self._info['shape']
+                return _LazyTensorSlice()
 
             def metadata(self):
                 return self._metadata
