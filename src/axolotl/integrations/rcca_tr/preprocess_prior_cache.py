@@ -31,19 +31,117 @@ Usage:
         --max_length 8000
 """
 
+import gc
+import glob
+import json
 import os
+import struct
+import threading
+import time
+
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import safetensors
+import transformers.modeling_utils
+
+
+# ---------------------------------------------------------------------------
+# Lustre/SLURM mmap Bypass — SafeOpenStreamer
+# ---------------------------------------------------------------------------
+# Lustre rejects 30-node concurrent mmap on the same 5 GB safetensor files.
+# Allocating a contiguous 5 GB numpy buffer also fails due to strict cluster
+# Virtual Address Space (VMAS) limits per CGroup.
+#
+# Solution: stream tensor-by-tensor via readinto() into a numpy buffer sized
+# to exactly ONE tensor (max ~2.5 GB for lm_head).  Since DeepSpeed ZeRO-3
+# is removed, these CPU buffers move straight into VRAM via Accelerate's
+# device_map="auto" and get properly GC'd.  No memory blobs, no mmap.
+# ---------------------------------------------------------------------------
+
+_global_stream_lock = threading.Lock()
+
+
+class SafeOpenStreamer:
+    """Drop-in replacement for ``safetensors.safe_open`` that avoids mmap."""
+
+    def __init__(self, filename, framework="pt", device="cpu"):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.filename = filename
+        self.device = device
+        with open(self.filename, "rb") as f:
+            header_size_bytes = f.read(8)
+            self.header_size = struct.unpack("<Q", header_size_bytes)[0]
+            header_json = f.read(self.header_size).decode("utf-8")
+            self.metadata = json.loads(header_json)
+
+        self.data_offset = 8 + self.header_size
+        self.tensor_keys = [k for k in self.metadata.keys() if k != "__metadata__"]
+
+    def keys(self):
+        return self.tensor_keys
+
+    def get_tensor(self, key):
+        info = self.metadata[key]
+        dtype_str = info["dtype"]
+        shape = info["shape"]
+        offsets = info["data_offsets"]
+
+        dtype_map = {
+            "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+            "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+            "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+        }
+        dt = dtype_map[dtype_str]
+        byte_size = offsets[1] - offsets[0]
+
+        with _global_stream_lock:
+            t_bytes_np = np.empty(byte_size, dtype=np.uint8)
+            m_view = memoryview(t_bytes_np)
+
+            with open(self.filename, "rb") as f:
+                f.seek(self.data_offset + offsets[0])
+                bytes_read = 0
+                while bytes_read < byte_size:
+                    n = f.readinto(m_view[bytes_read:])
+                    if n == 0:
+                        raise EOFError(f"Unexpected EOF while streaming tensor '{key}'")
+                    bytes_read += n
+
+            t_bytes = torch.from_numpy(t_bytes_np)
+            return t_bytes.view(dtype=dt).reshape(shape)
+
+    def get_slice(self, key):
+        class _SliceProxy:
+            def __init__(self, parent, k):
+                self.parent = parent
+                self.key = k
+            def __getitem__(self, idx):
+                return self.parent.get_tensor(self.key)[idx]
+        return _SliceProxy(self, key)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.metadata = None
+        self.tensor_keys = None
 
 
 def compute_prior_logits_for_batch(
@@ -65,62 +163,76 @@ def compute_prior_logits_for_batch(
         Dict with prior_target_logp, prior_top1_logp, prior_margin, each (B, T).
     """
     B, T = input_ids.shape
-    
+
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        shifted_target_logp = torch.zeros(B, T-1, device=input_ids.device)
-        shifted_top1_logp = torch.zeros(B, T-1, device=input_ids.device)
-        
-        # 1. PyTorch C++ kernels (like conv1d in Mamba/Qwen3.5-A3B) use 32-bit int math for indexing.
-        # If B=32, T=8000, D=16384, elements = 4.19 Billion > 2.14 Billion (int32 limit).
-        # We must sub-batch the forward pass to guarantee we never hit this catastrophic PyTorch limitation.
+        shifted_target_logp = torch.zeros(B, T - 1, device=input_ids.device)
+        shifted_top1_logp = torch.zeros(B, T - 1, device=input_ids.device)
+
+        # Sub-batch to stay under PyTorch's int32 indexing limit (2.14 B elements).
         mini_batch_size = 4
-        chunk_size = 1024 # [1, 1024, 151936] = ~600MB
-        
+        chunk_size = 1024  # [1, 1024, 151936] ≈ 600 MB
+
         for mb_start in range(0, B, mini_batch_size):
             mb_end = min(B, mb_start + mini_batch_size)
             mb_input_ids = input_ids[mb_start:mb_end]
             mb_attention_mask = attention_mask[mb_start:mb_end]
-            
-            # Forward base model without lm_head
-            base_model = getattr(model, model.base_model_prefix) if hasattr(model, "base_model_prefix") else model.model
+
+            # Forward through the transformer body (without lm_head)
+            base_model = (
+                getattr(model, model.base_model_prefix)
+                if hasattr(model, "base_model_prefix")
+                else model.model
+            )
             base_outputs = base_model(input_ids=mb_input_ids, attention_mask=mb_attention_mask)
-            hidden_states = base_outputs[0] if isinstance(base_outputs, tuple) else base_outputs.last_hidden_state
-            
-            # 2. Iterate items in this mini-batch and chunk sequence carefully for lm_head
+            hidden_states = (
+                base_outputs[0]
+                if isinstance(base_outputs, tuple)
+                else base_outputs.last_hidden_state
+            )
+
+            # Chunk the sequence through lm_head to cap VRAM usage
             for local_b in range(mb_end - mb_start):
                 global_b = mb_start + local_b
                 for i in range(0, T - 1, chunk_size):
                     i_end = min(i + chunk_size, T - 1)
-                    
-                    h_chunk = hidden_states[local_b:local_b+1, i:i_end, :] # [1, C, D]
-                    logits_chunk = model.lm_head(h_chunk)      # [1, C, V]
+
+                    h_chunk = hidden_states[local_b : local_b + 1, i:i_end, :]  # [1, C, D]
+                    logits_chunk = model.lm_head(h_chunk)                         # [1, C, V]
                     log_probs_chunk = F.log_softmax(logits_chunk.float(), dim=-1) # [1, C, V]
-                    
-                    # shift targets and masks
+
+                    # Align labels/masks to whichever GPU the pipeline placed the output on
                     chunk_dev = log_probs_chunk.device
-                    labels_chunk = labels[global_b:global_b+1, i+1:i_end+1].to(chunk_dev) # [1, C]
+                    labels_chunk = labels[global_b : global_b + 1, i + 1 : i_end + 1].to(chunk_dev)
                     safe_labels_chunk = labels_chunk.clamp(min=0)
-                    valid_chunk = ((labels_chunk != -100) & attention_mask[global_b:global_b+1, i:i_end].to(chunk_dev).bool())
-                    
-                    target_lp = log_probs_chunk.gather(dim=-1, index=safe_labels_chunk.unsqueeze(-1)).squeeze(-1) # [1, C]
-                    top1_lp = log_probs_chunk.max(dim=-1).values # [1, C]
-                    
-                    shifted_target_logp[global_b:global_b+1, i:i_end] = (target_lp * valid_chunk.float()).to(shifted_target_logp.device)
-                    shifted_top1_logp[global_b:global_b+1, i:i_end] = (top1_lp * valid_chunk.float()).to(shifted_top1_logp.device)
-                    
-                    del h_chunk, logits_chunk, log_probs_chunk, labels_chunk, safe_labels_chunk, valid_chunk, target_lp, top1_lp
-            
+                    valid_chunk = (
+                        (labels_chunk != -100)
+                        & attention_mask[global_b : global_b + 1, i:i_end].to(chunk_dev).bool()
+                    )
+
+                    target_lp = log_probs_chunk.gather(
+                        dim=-1, index=safe_labels_chunk.unsqueeze(-1)
+                    ).squeeze(-1)
+                    top1_lp = log_probs_chunk.max(dim=-1).values
+
+                    shifted_target_logp[global_b : global_b + 1, i:i_end] = (
+                        (target_lp * valid_chunk.float()).to(shifted_target_logp.device)
+                    )
+                    shifted_top1_logp[global_b : global_b + 1, i:i_end] = (
+                        (top1_lp * valid_chunk.float()).to(shifted_top1_logp.device)
+                    )
+
+                    del h_chunk, logits_chunk, log_probs_chunk
+                    del labels_chunk, safe_labels_chunk, valid_chunk, target_lp, top1_lp
+
             del base_outputs, hidden_states
             torch.cuda.empty_cache()
-                
-        shifted_margin = (shifted_top1_logp - shifted_target_logp)
 
-    # Pad back to length T: position 0 = 0.0 (no valid prior for first token)
-    # After this: prior_target_logp[t] = log p_0(input_ids[t] | context through t-1)
-    # for t >= 1, and 0.0 for t = 0.
-    prior_target_logp = F.pad(shifted_target_logp, (1, 0), value=0.0)  # (B, T)
-    prior_top1_logp = F.pad(shifted_top1_logp, (1, 0), value=0.0)      # (B, T)
-    prior_margin = F.pad(shifted_margin, (1, 0), value=0.0)             # (B, T)
+        shifted_margin = shifted_top1_logp - shifted_target_logp
+
+    # Pad position 0 with 0.0 (no valid prior for the first token)
+    prior_target_logp = F.pad(shifted_target_logp, (1, 0), value=0.0)
+    prior_top1_logp = F.pad(shifted_top1_logp, (1, 0), value=0.0)
+    prior_margin = F.pad(shifted_margin, (1, 0), value=0.0)
 
     return {
         "prior_target_logp": prior_target_logp.cpu(),
@@ -139,53 +251,49 @@ def main():
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=8000)
-    parser.add_argument("--merge_dir", type=str, default=None, help="If provided, merges all rank cache chunks in dir to output_path and exits.")
+    parser.add_argument(
+        "--merge_dir", type=str, default=None,
+        help="If provided, merges all rank cache chunks in dir to output_path and exits.",
+    )
     parser.add_argument("--chat_template", type=str, default=None)
     parser.add_argument(
         "--axolotl_config", type=str, default=None,
-        help="Path to axolotl YAML config to extract chat_template_jinja from."
+        help="Path to axolotl YAML config to extract chat_template_jinja from.",
     )
     parser.add_argument(
         "--chat_template_jinja", type=str, default=None,
-        help="Jinja2 template string for chat formatting (overrides tokenizer default)."
+        help="Jinja2 template string for chat formatting (overrides tokenizer default).",
     )
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------
+    # Fast-path: merge previously generated rank chunks and exit
+    # ------------------------------------------------------------------
     if args.merge_dir:
-        import torch
-        from tqdm import tqdm
-        import glob
         print(f"Merging cache chunks from {args.merge_dir} into {args.output_path}...")
-        chunks = glob.glob(os.path.join(args.merge_dir, "prior_cache_rank_*.pt"))
+        chunks = sorted(
+            glob.glob(os.path.join(args.merge_dir, "prior_cache_rank_*.pt")),
+            key=lambda x: int(os.path.basename(x).split("_rank_")[-1].split(".pt")[0]),
+        )
         all_tgt, all_top1, all_mrgn = [], [], []
-        # sort by rank numerically carefully
-        chunks = sorted(chunks, key=lambda x: int(os.path.basename(x).split('_rank_')[-1].split('.pt')[0]))
         for f in tqdm(chunks, desc="Merging"):
             c = torch.load(f, weights_only=False)
-            all_tgt.extend(c['prior_target_logp'])
-            all_top1.extend(c['prior_top1_logp'])
-            all_mrgn.extend(c['prior_margin'])
-        torch.save({
-            "prior_target_logp": all_tgt,
-            "prior_top1_logp": all_top1,
-            "prior_margin": all_mrgn,
-        }, args.output_path)
-        print(f"Merged {len(all_tgt)} samples to {args.output_path}.")
+            all_tgt.extend(c["prior_target_logp"])
+            all_top1.extend(c["prior_top1_logp"])
+            all_mrgn.extend(c["prior_margin"])
+        torch.save(
+            {"prior_target_logp": all_tgt, "prior_top1_logp": all_top1, "prior_margin": all_mrgn},
+            args.output_path,
+        )
+        print(f"Merged {len(all_tgt)} samples → {args.output_path}")
         return
 
-    # NOTE: Do NOT set OFFLINE envvars here!
-    # They must be set AFTER snapshot_download on Rank 0 so files can be fetched.
-    
+    # ------------------------------------------------------------------
+    # Distributed setup
+    # ------------------------------------------------------------------
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1"))) 
+    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
-
-    # --- HPC NFS DDoS Bypass Removed ---
-    # We no longer copy to `/tmp` because `/tmp` is typically a RAM-backed tmpfs on SLURM, 
-    # and copying a 54GB model into it instantly exhausts 54GB of Physical RAM before inference even starts!
-    # Instead, our sequential staggered loading (implemented below) sufficiently protects the NFS from DDoS
-    # without sacrificing Node Virtual Memory.
-    pass
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on cuda:{local_rank}")
 
@@ -201,151 +309,49 @@ def main():
     elif args.chat_template_jinja:
         custom_template = args.chat_template_jinja
 
-    import time
-    import fcntl
-    
-    # Stagger model loading across nodes by 3 seconds each to avoid Lustre NFS overload
+    # Stagger model loading across nodes to avoid Lustre NFS overload
     num_nodes = int(os.environ.get("NNODES", world_size // 4 if world_size >= 4 else 1))
     node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
     time.sleep(node_id * 3)
-    
-    # We rely on Accelerate / DeepSpeed zero-3 for memory-efficient loading.
-    # When zero-3 is enabled, transformers automatically uses deepspeed.zero.Init()
-    # to partition the model across GPUs WITHOUT loading the full 50GB into CPU RAM.
-    # Add a barrier to ensure only Rank 0 pulls HuggingFace files to cache first to avoid race conditions 
-    import torch.distributed as dist
-    import datetime
-    
-    # Initialize basic gloo process group just for this barrier if not initialized
+
+    # Lightweight gloo process group for the final save-barrier only
     if dist.is_available() and not dist.is_initialized():
-         dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=4))
-         
-    
-    # Every rank calls snapshot_download independently.
-    # huggingface_hub handles file locking internally, so concurrent calls are safe.
-    # This ensures each node has the files in its local HF cache before loading.
+        dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=4))
+
+    # Download / verify model files (huggingface_hub handles file locking)
     from huggingface_hub import snapshot_download
     print(f"[Rank {rank}] Downloading/verifying model files via snapshot_download...")
     local_model_path = snapshot_download(
         repo_id=args.base_model,
         allow_patterns=["*.json", "*.safetensors", "*.model", "*.bin", "*.txt"],
-        max_workers=1,  # conservative to avoid Lustre overload
+        max_workers=1,
     )
     print(f"[Rank {rank}] Model files ready at: {local_model_path}")
-    
-    # Load tokenizer from the local path to avoid any HF Hub resolution issues
-    tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True, local_files_only=True)
-    
-    # Now set offline mode to prevent any further network calls
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        local_model_path, trust_remote_code=True, local_files_only=True,
+    )
+
+    # Lock down to offline mode from here on
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
-    
+
     if dist.is_initialized():
         dist.barrier()
-        
-    print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
-    
-    print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
-    
-    # -------------------------------------------------------------------------
-    # Lustre/SLURM mmap Bypass Patch (Tensor Streamer `SafeOpenStreamer`)
-    # -------------------------------------------------------------------------
-    # Lustre rejects 30-node concurrent `mmap`. 
-    # Furthermore, allocating a contiguous 5GB `numpy.empty` RAM buffer fails 
-    # due to severe cluster Virtual Address Space (VMAS) limits.
-    # SOLUTION: Use `readinto()` but stream TENSOR-BY-TENSOR (max ~2.5GB for lm_head) 
-    # straight into Numpy `empty()`. Since DeepSpeed ZeRO-3 is removed, these buffers
-    # move immediately to VRAM via Accelerate and get properly GC'd. No memory blobs!
-    
-    import safetensors
-    import transformers.modeling_utils
-    import json
-    import struct
-    import torch
-    import threading
 
-    _global_stream_lock = threading.Lock()
-
-    class SafeOpenStreamer:
-        def __init__(self, filename, framework="pt", device="cpu"):
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            self.filename = filename
-            self.device = device
-            with open(self.filename, 'rb') as f:
-                header_size_bytes = f.read(8)
-                self.header_size = struct.unpack('<Q', header_size_bytes)[0]
-                header_json = f.read(self.header_size).decode('utf-8')
-                self.metadata = json.loads(header_json)
-                
-            self.data_offset = 8 + self.header_size
-            self.tensor_keys = [k for k in self.metadata.keys() if k != '__metadata__']
-            
-        def keys(self):
-            return self.tensor_keys
-            
-        def get_tensor(self, key):
-            info = self.metadata[key]
-            dtype_str = info['dtype']
-            shape = info['shape']
-            offsets = info['data_offsets']
-            
-            dtype_map = {
-                "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
-                "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
-                "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool
-            }
-            dt = dtype_map[dtype_str]
-            byte_size = offsets[1] - offsets[0]
-            
-            with _global_stream_lock:
-                import numpy as np
-                # Allocate exactly the size of ONE tensor, bypassing OS 5GB fragmentation
-                t_bytes_np = np.empty(byte_size, dtype=np.uint8)
-                m_view = memoryview(t_bytes_np)
-                
-                with open(self.filename, 'rb') as f:
-                    f.seek(self.data_offset + offsets[0])
-                    bytes_read = 0
-                    while bytes_read < byte_size:
-                        n = f.readinto(m_view[bytes_read:])
-                        if n == 0:
-                            raise EOFError(f"Unexpected EOF while streaming {key}")
-                        bytes_read += n
-                        
-                t_bytes = torch.from_numpy(t_bytes_np)
-                return t_bytes.view(dtype=dt).reshape(shape)
-            
-        def get_slice(self, key):
-            class _SliceProxy:
-                def __init__(self, parent, key):
-                    self.parent = parent
-                    self.key = key
-                def __getitem__(self, idx):
-                    t = self.parent.get_tensor(self.key)
-                    return t[idx]
-            return _SliceProxy(self, key)
-            
-        def __enter__(self):
-            return self
-            
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            self.metadata = None
-            self.tensor_keys = None
-
+    # ------------------------------------------------------------------
+    # Patch safetensors to bypass Lustre mmap
+    # ------------------------------------------------------------------
     safetensors.safe_open = SafeOpenStreamer
     transformers.modeling_utils.safe_open = SafeOpenStreamer
-    print(f"[Rank {rank}] Applied SafeOpenStreamer (Tensor-by-Tensor, 0 mmap, Minimal RAM)")
-    # -------------------------------------------------------------------------
-    
-    # Generate prior cache via Single-Node Multi-GPU pipeline parallelism (Data Parallel across nodes)!
-    # This completely eliminates DeepSpeed ZeRO-3's cross-node NCCL communication bottlenecks.
-    print(f"[Rank {rank}/{world_size}] Using Accelerate device_map='auto' for maximum forward-pass speed...")
-    
+    print(f"[Rank {rank}] Applied SafeOpenStreamer (tensor-by-tensor, zero mmap)")
+
+    # ------------------------------------------------------------------
+    # Load model — single-node multi-GPU pipeline via Accelerate
+    # ------------------------------------------------------------------
+    print(f"[Rank {rank}/{world_size}] Loading {local_model_path} via device_map='auto'...")
+
     model = AutoModelForCausalLM.from_pretrained(
         local_model_path,
         device_map="auto",
@@ -356,45 +362,45 @@ def main():
         ignore_mismatched_sizes=True,
     )
     model.eval()
-    import gc
     gc.collect()
 
     print(f"[Rank {rank}/{world_size}] Model loaded successfully!")
 
-    print(f"[Rank {rank}] Starting independent inference for chunk {rank}...")
-
+    # ------------------------------------------------------------------
+    # Dataset sharding — each rank processes its own chunk independently
+    # ------------------------------------------------------------------
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
-
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    from datasets import load_dataset
     dataset = load_dataset(args.dataset_path, split=args.dataset_split)
-    
     print(f"[Rank {rank}] Dataset total length: {len(dataset)}")
-    
+
     if world_size > 1:
-        chunk_size = (len(dataset) + world_size - 1) // world_size
-        start_sample = rank * chunk_size
-        end_sample = min((rank + 1) * chunk_size, len(dataset))
+        shard_size = (len(dataset) + world_size - 1) // world_size
+        start_sample = rank * shard_size
+        end_sample = min((rank + 1) * shard_size, len(dataset))
         dataset = dataset.select(range(start_sample, end_sample))
-    
+
     print(f"[Rank {rank}] Processing {len(dataset)} samples...")
 
     all_target_logp = []
     all_top1_logp = []
     all_margin = []
 
-    # Process in batches
+    # ------------------------------------------------------------------
+    # Inference loop
+    # ------------------------------------------------------------------
     for start_idx in tqdm(
         range(0, len(dataset), args.batch_size),
-        desc="Cache Gen [Rank 0]",
+        desc=f"Cache Gen [Rank {rank}]",
         disable=(rank != 0),
-        mininterval=2.0
+        mininterval=2.0,
     ):
         end_idx = min(start_idx + args.batch_size, len(dataset))
         batch_samples = dataset[start_idx:end_idx]
 
+        # Detect message column
         messages_col = None
         for col in ["messages", "conversations"]:
             if col in batch_samples:
@@ -403,18 +409,17 @@ def main():
 
         # Tokenize
         if messages_col:
-            # Chat format — apply chat template
             texts = []
             for i in range(len(batch_samples[messages_col])):
                 msgs = batch_samples[messages_col][i]
-                
-                # Auto-convert ShareGPT format to standard HuggingFace messages format
+
+                # Auto-convert ShareGPT ↔ standard HuggingFace messages format
                 standard_msgs = []
                 if isinstance(msgs, list):
                     for m in msgs:
                         if isinstance(m, dict):
                             if "from" in m and "value" in m:
-                                role = "user" if m["from"] in ["human", "user"] else "assistant"
+                                role = "user" if m["from"] in ("human", "user") else "assistant"
                                 content = m["value"] if m["value"] is not None else ""
                                 standard_msgs.append({"role": role, "content": content})
                             elif "role" in m and "content" in m:
@@ -428,7 +433,7 @@ def main():
                     standard_msgs = msgs
 
                 text = tokenizer.apply_chat_template(
-                    standard_msgs, tokenize=False, add_generation_prompt=False
+                    standard_msgs, tokenize=False, add_generation_prompt=False,
                 )
                 texts.append(text)
         elif "text" in batch_samples:
@@ -450,22 +455,20 @@ def main():
         input_ids = encoded["input_ids"].to(model.device)
         attention_mask = encoded["attention_mask"].to(model.device)
 
-        # Labels = input_ids shifted (for causal LM)
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
 
-        cache = compute_prior_logits_for_batch(
-            model, input_ids, attention_mask, labels
-        )
+        cache = compute_prior_logits_for_batch(model, input_ids, attention_mask, labels)
 
-        # Store per-sample (variable length)
         for i in range(input_ids.size(0)):
             seq_len = attention_mask[i].sum().item()
             all_target_logp.append(cache["prior_target_logp"][i, :seq_len])
             all_top1_logp.append(cache["prior_top1_logp"][i, :seq_len])
             all_margin.append(cache["prior_margin"][i, :seq_len])
 
-    # Save
+    # ------------------------------------------------------------------
+    # Save rank-local cache
+    # ------------------------------------------------------------------
     cache_data = {
         "prior_target_logp": all_target_logp,
         "prior_top1_logp": all_top1_logp,
@@ -477,14 +480,9 @@ def main():
         cache_path = Path(args.output_path)
         if cache_path.is_dir():
             cache_path = cache_path / "prior_cache.pt"
-            
-    torch.save(cache_data, cache_path)
-    print(f"[Rank {rank}] Prior cache saved to {cache_path} ({len(all_target_logp)} samples)")
 
-    if world_size > 1:
-        print(f"[Rank {rank}] Waiting for all ranks to finish...")
-        dist.barrier()
-        print(f"[Rank {rank}] All ranks completed!")
+    torch.save(cache_data, cache_path)
+    print(f"[Rank {rank}] Prior cache saved → {cache_path} ({len(all_target_logp)} samples)")
 
 
 if __name__ == "__main__":
