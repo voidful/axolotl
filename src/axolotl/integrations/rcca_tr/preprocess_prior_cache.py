@@ -322,7 +322,7 @@ def main():
                             raise EOFError("Unexpected EOF while streaming safetensors")
                         bytes_read += n
                         
-                return t_bytes.view(dtype=dt).reshape(shape).clone()
+                return t_bytes.view(dtype=dt).reshape(shape)
             
         def get_slice(self, key):
             # Evaluate eagerly since we stream directly to RAM
