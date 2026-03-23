@@ -210,78 +210,26 @@ def main():
     node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
     time.sleep(node_id * 3)
     
-    # OS-level lock serializes loading within each node (prevents concurrent mmap VAS explosion)
-    lock_path = f"/tmp/hf_model_load_lock_{os.environ.get('SLURM_JOB_ID', 'local')}.lock"
-    print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        # Lustre doesn't support mmap — bypass with regular file I/O
-        import json as _json, struct as _struct, safetensors, transformers.modeling_utils
-        class SafeOpenNoMmap:
-            """Drop-in replacement for safetensors.safe_open using regular file I/O."""
-            def __init__(self, filename, framework="pt", device="cpu"):
-                self.device = device
-                self._filename = filename
-                with open(filename, 'rb') as f:
-                    hs = _struct.unpack('<Q', f.read(8))[0]
-                    self._header = _json.loads(f.read(hs))
-                self._data_offset = 8 + hs
-                self._metadata = self._header.pop('__metadata__', {})
-                self._dtypes = {'F16': torch.float16, 'BF16': torch.bfloat16, 'F32': torch.float32,
-                                'F64': torch.float64, 'I8': torch.int8, 'I16': torch.int16,
-                                'I32': torch.int32, 'I64': torch.int64, 'U8': torch.uint8, 'BOOL': torch.bool}
-            def keys(self): return list(self._header.keys())
-            def metadata(self): return self._metadata
-            def _read_tensor(self, name):
-                import ctypes
-                info = self._header[name]
-                s, e = info['data_offsets']
-                nbytes = e - s
-                dtype = self._dtypes[info['dtype']]
-                # Calculate numel from shape
-                numel = 1
-                for d in info['shape']:
-                    numel *= d
-                # Allocate tensor via torch (uses system malloc, not Python heap)
-                t = torch.empty(numel, dtype=dtype)
-                ptr = t.data_ptr()
-                # Read file data in chunks directly into tensor memory
-                CHUNK = 64 * 1024 * 1024  # 64 MB
-                with open(self._filename, 'rb') as f:
-                    f.seek(self._data_offset + s)
-                    offset = 0
-                    while offset < nbytes:
-                        chunk = f.read(min(CHUNK, nbytes - offset))
-                        if not chunk:
-                            break
-                        ctypes.memmove(ptr + offset, chunk, len(chunk))
-                        offset += len(chunk)
-                return t.reshape(info['shape'])
-            def get_tensor(self, name):
-                t = self._read_tensor(name)
-                return t.to(self.device) if self.device != "cpu" else t
-            def get_slice(self, name):
-                info, parent = self._header[name], self
-                class _S:
-                    def __init__(self): self._t = None
-                    def _m(self):
-                        if self._t is None: self._t = parent._read_tensor(name)
-                        return self._t
-                    def __getitem__(self, i): return self._m()[i]
-                    def get_shape(self): return list(info['shape'])
-                    @property
-                    def shape(self): return info['shape']
-                return _S()
-            def __enter__(self): return self
-            def __exit__(self, *a): pass
-        safetensors.safe_open = SafeOpenNoMmap
-        transformers.modeling_utils.safe_open = SafeOpenNoMmap
-        try:
-            import safetensors.torch; safetensors.torch.safe_open = SafeOpenNoMmap
-        except Exception: pass
-        print(f"[Rank {rank}] Patched safetensors to bypass Lustre mmap")
-
-        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
+    # We rely on Accelerate / DeepSpeed zero-3 for memory-efficient loading.
+    # When zero-3 is enabled, transformers automatically uses deepspeed.zero.Init()
+    # to partition the model across GPUs WITHOUT loading the full 50GB into CPU RAM.
+    print(f"[Rank {rank}/{world_size}] Loading {args.base_model} using Accelerate/DeepSpeed...")
+    import transformers
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+    
+    if is_deepspeed_zero3_enabled():
+        print(f"[Rank {rank}] DeepSpeed ZeRO-3 is enabled. Loading partitioned model...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+            local_files_only=False,
+            low_cpu_mem_usage=True, # Critical for ZeRO-3
+        )
+    else:
+        # Fallback to device_map if not using ZeRO-3 (requires 1 node / lots of RAM)
+        print(f"[Rank {rank}] WARNING: ZeRO-3 not detected, falling back to device_map. May OOM on Lustre.")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
