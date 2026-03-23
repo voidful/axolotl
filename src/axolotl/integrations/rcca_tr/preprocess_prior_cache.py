@@ -358,17 +358,7 @@ def main():
 
     print(f"[Rank {rank}/{world_size}] Model loaded successfully!")
 
-    # Global barrier: wait for ALL ranks to finish loading before any inference begins
-    # Use gloo backend (CPU-only) to avoid allocating extra CUDA VAS
-    import torch.distributed as dist
-    import datetime
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="gloo",
-            timeout=datetime.timedelta(hours=4)
-        )
-    dist.barrier()
-    print(f"[Rank {rank}] All ranks loaded. Starting inference...")
+    print(f"[Rank {rank}] Starting independent inference for chunk {rank}...")
 
     output_dir = Path(args.output_path).parent if Path(args.output_path).suffix else Path(args.output_path)
 
