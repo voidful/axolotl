@@ -224,10 +224,19 @@ def main():
         print(f"[Rank {rank}] Forcing DeepSpeed ZeRO-3 Init context to partition model weights...")
         
         # Determine deepspeed config path from environment, or use default zero3
-        ds_config = os.environ.get("DEEPSPEED_CONFIG", "deepspeed_configs/zero3_custom.json")
-        if not os.path.exists(ds_config):
+        ds_config_path = os.environ.get("DEEPSPEED_CONFIG", "deepspeed_configs/zero3_custom.json")
+        if os.path.exists(ds_config_path):
+             import json
+             with open(ds_config_path, "r") as f:
+                 ds_config = json.load(f)
+             # DeepSpeed standalone Init() doesn't understand "auto"
+             if ds_config.get("train_micro_batch_size_per_gpu") == "auto":
+                 ds_config["train_micro_batch_size_per_gpu"] = 1
+             if ds_config.get("train_batch_size") == "auto":
+                 ds_config["train_batch_size"] = 1
+        else:
              # minimal inline config if file not found
-             ds_config = {"train_micro_batch_size_per_gpu": 1, "zero_optimization": {"stage": 3}}
+             ds_config = {"train_micro_batch_size_per_gpu": 1, "train_batch_size": 1, "zero_optimization": {"stage": 3}}
              
         with deepspeed.zero.Init(config_dict_or_path=ds_config, remote_device=None):
             model = AutoModelForCausalLM.from_pretrained(
