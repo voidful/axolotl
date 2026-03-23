@@ -152,7 +152,6 @@ def main():
     args = parser.parse_args()
 
     if args.merge_dir:
-        import os
         import torch
         from tqdm import tqdm
         import glob
