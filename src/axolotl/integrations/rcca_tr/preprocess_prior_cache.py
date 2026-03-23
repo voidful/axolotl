@@ -215,20 +215,66 @@ def main():
     print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        # Monkey-patch safetensors to bypass mmap (kernel/cgroup refuses 50GB mmap)
+        # This reads tensors using regular file I/O instead
+        import json as _json
+        import struct as _struct
+        import safetensors
 
-        # Raise per-process virtual memory limit (SLURM often sets this too low for 50GB mmap)
-        import resource
+        class SafeOpenNoMmap:
+            """Drop-in replacement for safetensors.safe_open using regular file I/O."""
+            def __init__(self, filename, framework="pt", device="cpu"):
+                self.device = device
+                self._file = open(filename, 'rb')
+                header_size = _struct.unpack('<Q', self._file.read(8))[0]
+                header_bytes = self._file.read(header_size)
+                self._header = _json.loads(header_bytes)
+                self._data_offset = 8 + header_size
+                self._metadata = self._header.pop('__metadata__', {})
+
+            def keys(self):
+                return list(self._header.keys())
+
+            def get_tensor(self, name):
+                info = self._header[name]
+                start, end = info['data_offsets']
+                self._file.seek(self._data_offset + start)
+                raw = self._file.read(end - start)
+                dtype_map = {
+                    'F16': torch.float16, 'BF16': torch.bfloat16,
+                    'F32': torch.float32, 'F64': torch.float64,
+                    'I8': torch.int8, 'I16': torch.int16,
+                    'I32': torch.int32, 'I64': torch.int64,
+                    'U8': torch.uint8, 'BOOL': torch.bool,
+                }
+                t = torch.frombuffer(bytearray(raw), dtype=dtype_map[info['dtype']])
+                t = t.reshape(info['shape'])
+                if self.device != "cpu":
+                    t = t.to(self.device)
+                return t
+
+            def metadata(self):
+                return self._metadata
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._file.close()
+
+            def __del__(self):
+                if hasattr(self, '_file') and not self._file.closed:
+                    self._file.close()
+
+        _original_safe_open = safetensors.safe_open
+        safetensors.safe_open = SafeOpenNoMmap
+        # Also patch the import location used by transformers
         try:
-            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-            print(f"[Rank {rank}] Current RLIMIT_AS: soft={soft}, hard={hard}")
-            resource.setrlimit(resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            print(f"[Rank {rank}] Raised RLIMIT_AS to unlimited")
-        except (ValueError, resource.error) as e:
-            print(f"[Rank {rank}] Could not raise RLIMIT_AS: {e}, trying RLIMIT_DATA...")
-            try:
-                resource.setrlimit(resource.RLIMIT_DATA, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            except Exception:
-                pass
+            import safetensors.torch
+            safetensors.torch.safe_open = SafeOpenNoMmap
+        except Exception:
+            pass
+        print(f"[Rank {rank}] Patched safetensors.safe_open to bypass mmap")
 
         print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -240,6 +286,13 @@ def main():
             local_files_only=False,
             low_cpu_mem_usage=True,
         )
+
+        # Restore original safe_open
+        safetensors.safe_open = _original_safe_open
+        try:
+            safetensors.torch.safe_open = _original_safe_open
+        except Exception:
+            pass
         model.eval()
         import gc
         gc.collect()
