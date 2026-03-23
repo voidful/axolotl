@@ -244,49 +244,103 @@ def main():
     print(f"[Rank {rank}/{world_size}] Loading {local_model_path} using Accelerate/DeepSpeed...")
     
     # -------------------------------------------------------------------------
-    # Lustre mmap Bypass Patch
+    # Lustre/SLURM mmap Bypass Patch (Ultimate Streaming Version)
     # -------------------------------------------------------------------------
-    # Even with ZeRO-3, `transformers` uses `safetensors.safe_open` to read
-    # the 5GB state dict shards into RAM before ZeRO-3 partitions them.
-    # `safetensors` rigidly uses `mmap`. On Lustre, concurrent `mmap` of 
-    # large files often fails with "Cannot allocate memory" (ENOMEM).
-    # To bypass this without dealing with PyTorch C++ layout bugs, we temporarily 
-    # copy the file to the local RAM disk (`/tmp`), mmap it from there (which 
-    # never fails on Linux tmpfs), and then let the OS automatically GC the file 
-    # when the fd closes.
+    # The SLURM job `srun` environment has extremely strict Virtual Memory (VAS)
+    # limits (e.g. `ulimit -v`). When `transformers` tries to `mmap` a 5GB 
+    # safetensors file via Rust backend, the OS immediately rejects it with ENOMEM,
+    # even if we put the file on local `/tmp`!
+    # DeepSpeed ZeRO-3 partitions memory *after* tensors are loaded into RAM.
+    # To get past the OS `mmap` ceiling *before* ZeRO-3 acts, we MUST stream the 
+    # tensor data strictly using standard file I/O (`read()`), bypassing `mmap` entirely.
+    # 
+    # This class performs a TRULY ZERO-OVERHEAD stream: it creates a `torch.uint8` 
+    # buffer, grabs its C-memory pointer via `.numpy()`, and tells the Linux Kernel 
+    # to dump disk bytes directly into that PyTorch tensor using `f.readinto()`.
+    
     import safetensors
-    import tempfile
-    import shutil
     import transformers.modeling_utils
-    
-    _orig_safe_open = safetensors.safe_open
-    
-    class TmpSafeOpen:
+    import json
+    import struct
+    import torch
+    import os
+
+    class SafeOpenStreamer:
         def __init__(self, filename, framework="pt", device="cpu"):
-            fd, tmp_path = tempfile.mkstemp(prefix="st_", dir="/tmp")
-            os.close(fd)
-            # This is fast: memory-to-memory copy from Lustre to local RAM disk
-            shutil.copy2(filename, tmp_path)
-            # Safe_open on local tmpfs works flawlessly
-            self.f = _orig_safe_open(tmp_path, framework=framework, device=device)
-            self.keys = self.f.keys
-            self.get_tensor = self.f.get_tensor
-            self.get_slice = self.f.get_slice
-            # Mark file for deletion immediately. It stays alive in OS until self.f is garbage collected.
-            os.unlink(tmp_path)
+            self.filename = filename
+            self.device = device
+            
+            # Read 8 byte header size
+            with open(self.filename, 'rb') as f:
+                header_size_bytes = f.read(8)
+                self.header_size = struct.unpack('<Q', header_size_bytes)[0]
+                header_json = f.read(self.header_size).decode('utf-8')
+                self.metadata = json.loads(header_json)
+                
+            self.data_offset = 8 + self.header_size
+            self.tensor_keys = [k for k in self.metadata.keys() if k != '__metadata__']
+            
+        def keys(self):
+            return self.tensor_keys
+            
+        def get_tensor(self, key):
+            info = self.metadata[key]
+            dtype_str = info['dtype']
+            shape = info['shape']
+            offsets = info['data_offsets']
+            
+            dtype_map = {
+                "F64": torch.float64,
+                "F32": torch.float32,
+                "F16": torch.float16,
+                "BF16": torch.bfloat16,
+                "I64": torch.int64,
+                "I32": torch.int32,
+                "I16": torch.int16,
+                "I8": torch.int8,
+                "U8": torch.uint8,
+                "BOOL": torch.bool
+            }
+            dt = dtype_map[dtype_str]
+            byte_size = offsets[1] - offsets[0]
+            
+            # Allocate only the precisely required bytes as uint8
+            t_bytes = torch.empty(byte_size, dtype=torch.uint8, device="cpu")
+            m_view = memoryview(t_bytes.numpy())
+            
+            # Stream directly from disk into PyTorch C buffer, bypassing python overhead completely
+            with open(self.filename, 'rb') as f:
+                f.seek(self.data_offset + offsets[0])
+                bytes_read = 0
+                while bytes_read < byte_size:
+                    n = f.readinto(m_view[bytes_read:])
+                    if n == 0:
+                        raise EOFError("Unexpected EOF while streaming safetensors")
+                    bytes_read += n
+                    
+            return t_bytes.view(dtype=dt).reshape(shape)
+            
+        def get_slice(self, key):
+            # Evaluate eagerly since we stream directly to RAM
+            class _SliceProxy:
+                def __init__(self, parent, key):
+                    self.parent = parent
+                    self.key = key
+                def __getitem__(self, idx):
+                    t = self.parent.get_tensor(self.key)
+                    return t[idx]
+            return _SliceProxy(self, key)
             
         def __enter__(self):
             return self
             
         def __exit__(self, exc_type, exc_val, exc_tb):
             pass
-            
-    # CRITICAL: We must patch the reference that transformers actually uses!
-    # transformers imports it as `from safetensors import safe_open`, 
-    # so we must patch `transformers.modeling_utils.safe_open`
-    safetensors.safe_open = TmpSafeOpen
-    transformers.modeling_utils.safe_open = TmpSafeOpen
-    print(f"[Rank {rank}] Applied TmpSafeOpen mmap patch successfully.")
+
+    # Patch both the origin and transformers references
+    safetensors.safe_open = SafeOpenStreamer
+    transformers.modeling_utils.safe_open = SafeOpenStreamer
+    print(f"[Rank {rank}] Applied SafeOpenStreamer (Complete mmap avoidance!)")
     # -------------------------------------------------------------------------
     
     # Force DeepSpeed ZeRO-3 partitioned loading manually
