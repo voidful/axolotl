@@ -214,22 +214,34 @@ def main():
     # When zero-3 is enabled, transformers automatically uses deepspeed.zero.Init()
     # to partition the model across GPUs WITHOUT loading the full 50GB into CPU RAM.
     print(f"[Rank {rank}/{world_size}] Loading {args.base_model} using Accelerate/DeepSpeed...")
-    import transformers
-    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
     
-    if is_deepspeed_zero3_enabled():
-        print(f"[Rank {rank}] DeepSpeed ZeRO-3 is enabled. Loading partitioned model...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.base_model,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-            local_files_only=False,
-            low_cpu_mem_usage=True, # Critical for ZeRO-3
-        )
-    else:
-        # Fallback to device_map if not using ZeRO-3 (requires 1 node / lots of RAM)
-        print(f"[Rank {rank}] WARNING: ZeRO-3 not detected, falling back to device_map. May OOM on Lustre.")
+    # Force DeepSpeed ZeRO-3 partitioned loading manually
+    # Since this is a standalone script, we must initialize the zero.Init context explicitly
+    try:
+        import deepspeed
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamType
+        
+        print(f"[Rank {rank}] Forcing DeepSpeed ZeRO-3 Init context to partition model weights...")
+        
+        # Determine deepspeed config path from environment, or use default zero3
+        ds_config = os.environ.get("DEEPSPEED_CONFIG", "deepspeed_configs/zero3_custom.json")
+        if not os.path.exists(ds_config):
+             # minimal inline config if file not found
+             ds_config = {"train_micro_batch_size_per_gpu": 1, "zero_optimization": {"stage": 3}}
+             
+        with deepspeed.zero.Init(config_dict_or_path=ds_config, remote_device=None):
+            model = AutoModelForCausalLM.from_pretrained(
+                args.base_model,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation="sdpa",
+                local_files_only=False,
+                low_cpu_mem_usage=True, # Critical for ZeRO-3
+            )
+        print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
+    except ImportError:
+        # Fallback to device_map if deepspeed is not installed
+        print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
         model = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
