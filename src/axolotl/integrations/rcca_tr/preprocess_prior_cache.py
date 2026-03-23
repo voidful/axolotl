@@ -215,16 +215,27 @@ def main():
     print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Waiting for lock {lock_path}...")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading {args.base_model} on cuda:{local_rank}...")
+        
+        # Bypass Lustre mmap bug by caching to RAM disk (/dev/shm)
+        shm_model_dir = f"/dev/shm/hf_model_{args.base_model.replace('/', '_')}"
+        if not os.path.exists(shm_model_dir):
+            import shutil
+            import os
+            from huggingface_hub import snapshot_download
+            print(f"[Rank {rank}/{world_size} | Local {local_rank}] Copying model to RAM Disk {shm_model_dir} (bypassing Lustre mmap bug)...")
+            real_model_path = snapshot_download(args.base_model, local_files_only=False)
+            shutil.copytree(real_model_path, shm_model_dir)
+            print(f"[Rank {rank}/{world_size} | Local {local_rank}] Copy to RAM Disk completed!")
+
+        print(f"[Rank {rank}/{world_size} | Node {node_id} Local {local_rank}] Acquired lock! Loading from RAM Disk on cuda:{local_rank}...")
         model = AutoModelForCausalLM.from_pretrained(
-            args.base_model,
+            shm_model_dir,
             torch_dtype=torch.bfloat16,
             device_map={"": local_rank},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=False,
+            local_files_only=True,
             low_cpu_mem_usage=True,
-            use_safetensors=False
         )
         model.eval()
         import gc
