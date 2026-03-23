@@ -189,38 +189,37 @@ def compute_prior_logits_for_batch(
             )
 
             # Chunk the sequence through lm_head to cap VRAM usage
-            for local_b in range(mb_end - mb_start):
-                global_b = mb_start + local_b
-                for i in range(0, T - 1, chunk_size):
-                    i_end = min(i + chunk_size, T - 1)
+            # We process the entire mini-batch at once for the chunks!
+            for i in range(0, T - 1, chunk_size):
+                i_end = min(i + chunk_size, T - 1)
 
-                    h_chunk = hidden_states[local_b : local_b + 1, i:i_end, :]  # [1, C, D]
-                    logits_chunk = model.lm_head(h_chunk)                         # [1, C, V]
-                    log_probs_chunk = F.log_softmax(logits_chunk.float(), dim=-1) # [1, C, V]
+                h_chunk = hidden_states[:, i:i_end, :]  # [MB, C, D]
+                logits_chunk = model.lm_head(h_chunk)                         # [MB, C, V]
+                log_probs_chunk = F.log_softmax(logits_chunk.float(), dim=-1) # [MB, C, V]
 
-                    # Align labels/masks to whichever GPU the pipeline placed the output on
-                    chunk_dev = log_probs_chunk.device
-                    labels_chunk = labels[global_b : global_b + 1, i + 1 : i_end + 1].to(chunk_dev)
-                    safe_labels_chunk = labels_chunk.clamp(min=0)
-                    valid_chunk = (
-                        (labels_chunk != -100)
-                        & attention_mask[global_b : global_b + 1, i:i_end].to(chunk_dev).bool()
-                    )
+                # Align labels/masks to whichever GPU the pipeline placed the output on
+                chunk_dev = log_probs_chunk.device
+                labels_chunk = labels[mb_start : mb_end, i + 1 : i_end + 1].to(chunk_dev)
+                safe_labels_chunk = labels_chunk.clamp(min=0)
+                valid_chunk = (
+                    (labels_chunk != -100)
+                    & attention_mask[mb_start : mb_end, i:i_end].to(chunk_dev).bool()
+                )
 
-                    target_lp = log_probs_chunk.gather(
-                        dim=-1, index=safe_labels_chunk.unsqueeze(-1)
-                    ).squeeze(-1)
-                    top1_lp = log_probs_chunk.max(dim=-1).values
+                target_lp = log_probs_chunk.gather(
+                    dim=-1, index=safe_labels_chunk.unsqueeze(-1)
+                ).squeeze(-1)
+                top1_lp = log_probs_chunk.max(dim=-1).values
 
-                    shifted_target_logp[global_b : global_b + 1, i:i_end] = (
-                        (target_lp * valid_chunk.float()).to(shifted_target_logp.device)
-                    )
-                    shifted_top1_logp[global_b : global_b + 1, i:i_end] = (
-                        (top1_lp * valid_chunk.float()).to(shifted_top1_logp.device)
-                    )
+                shifted_target_logp[mb_start : mb_end, i:i_end] = (
+                    (target_lp * valid_chunk.float()).to(shifted_target_logp.device)
+                )
+                shifted_top1_logp[mb_start : mb_end, i:i_end] = (
+                    (top1_lp * valid_chunk.float()).to(shifted_top1_logp.device)
+                )
 
-                    del h_chunk, logits_chunk, log_probs_chunk
-                    del labels_chunk, safe_labels_chunk, valid_chunk, target_lp, top1_lp
+                del h_chunk, logits_chunk, log_probs_chunk
+                del labels_chunk, safe_labels_chunk, valid_chunk, target_lp, top1_lp
 
             del base_outputs, hidden_states
             torch.cuda.empty_cache()
@@ -356,6 +355,7 @@ def main():
         local_model_path,
         device_map="auto",
         torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
         trust_remote_code=True,
         local_files_only=True,
         low_cpu_mem_usage=True,
