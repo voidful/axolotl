@@ -263,8 +263,7 @@ def main():
     import json
     import struct
     import torch
-    import os
-
+    
     class SafeOpenStreamer:
         def __init__(self, filename, framework="pt", device="cpu"):
             self.filename = filename
