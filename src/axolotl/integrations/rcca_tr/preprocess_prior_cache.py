@@ -303,18 +303,7 @@ def main():
 
     print(f"[Rank {rank}/{world_size}] Loading model {args.base_model} on node GPUs")
 
-    # Apply custom chat template if specified
-    custom_template = None
-    if args.axolotl_config:
-        import yaml
-        with open(args.axolotl_config) as f:
-            ax_cfg = yaml.safe_load(f)
-        custom_template = ax_cfg.get("chat_template_jinja")
-        if custom_template and rank == 0:
-            print(f"Using chat_template_jinja from axolotl config: {args.axolotl_config}")
-    elif args.chat_template_jinja:
-        custom_template = args.chat_template_jinja
-
+    # (Chat template application moved below tokenizer initialization)
     # Stagger model loading across nodes to avoid Lustre NFS overload
     num_nodes = int(os.environ.get("NNODES", world_size // 4 if world_size >= 4 else 1))
     node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
@@ -333,6 +322,24 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         local_model_path, trust_remote_code=True, local_files_only=True,
     )
+
+    # Apply custom chat template if specified in config
+    if args.axolotl_config:
+        import yaml
+        from axolotl.utils.chat_templates import get_chat_template_from_config
+        with open(args.axolotl_config) as f:
+            ax_cfg = yaml.safe_load(f)
+        try:
+            custom_template = get_chat_template_from_config(ax_cfg, tokenizer=tokenizer)
+            if custom_template:
+                tokenizer.chat_template = custom_template
+                if rank == 0:
+                    print(f"Applied chat template '{ax_cfg.get('chat_template')}' to tokenizer.")
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning loading chat template: {e}")
+    elif args.chat_template_jinja:
+        tokenizer.chat_template = args.chat_template_jinja
 
     # Lock down to offline mode from here on
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
