@@ -43,12 +43,10 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
-import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -314,10 +312,6 @@ def main():
     node_id = rank // (world_size // num_nodes) if num_nodes > 0 else 0
     time.sleep(node_id * 3)
 
-    # Lightweight gloo process group for the final save-barrier only
-    if dist.is_available() and not dist.is_initialized():
-        dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=4))
-
     # Download / verify model files (huggingface_hub handles file locking)
     from huggingface_hub import snapshot_download
     print(f"[Rank {rank}] Downloading/verifying model files via snapshot_download...")
@@ -336,9 +330,6 @@ def main():
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
-
-    if dist.is_initialized():
-        dist.barrier()
 
     # ------------------------------------------------------------------
     # Patch safetensors to bypass Lustre mmap
