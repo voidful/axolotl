@@ -181,7 +181,7 @@ def compute_prior_logits_for_batch(
                 if hasattr(model, "base_model_prefix")
                 else model.model
             )
-            base_outputs = base_model(input_ids=mb_input_ids, attention_mask=mb_attention_mask)
+            base_outputs = base_model(input_ids=mb_input_ids, attention_mask=mb_attention_mask, use_cache=False)
             hidden_states = (
                 base_outputs[0]
                 if isinstance(base_outputs, tuple)
