@@ -1,0 +1,64 @@
+base_model: Qwen/Qwen3.5-35B-A3B
+low_cpu_mem_usage: true
+
+plugins:
+  - axolotl.integrations.rcca_tr.RCCATRPlugin
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+rcca_tr_trainer: true
+rcca_tr_conflict_lambda1: 1.0
+rcca_tr_conflict_lambda2: 0.5
+rcca_tr_conflict_tau: 1.0
+rcca_tr_reliability_beta: 0.5
+rcca_tr_reliability_tau: 1.0
+rcca_tr_epsilon_min: 0.01
+rcca_tr_epsilon_max: 1.0
+rcca_tr_kl_lambda: 1.0
+rcca_tr_use_smooth_objective: true
+rcca_tr_ema_decay: 0.999
+rcca_tr_drift_gamma: 1.0
+rcca_tr_prior_cache_path: ./prior_cache/prior_cache_35b.pt
+
+datasets:
+  - path: voidful/earica_text_train_v2
+    type: chat_template
+    field_messages: conversations
+    split: train
+    split_thinking: true
+
+dataset_prepared_path: ./prepared_data/rcca_tr_35b
+
+chat_template: qwen3_5
+
+sequence_len: 8192
+sample_packing: true
+pad_to_sequence_len: false
+
+gradient_accumulation_steps: 2
+micro_batch_size: 1
+batch_flattening: false
+group_by_length: true
+num_epochs: 3
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2e-5
+
+bf16: true
+gradient_checkpointing: true
+flash_attention: true
+dataloader_num_workers: 4
+val_set_size: 0.05
+save_strategy: epoch
+output_dir: ./outputs/rcca-tr-35b
+
+deepspeed: deepspeed_configs/zero2.json
+
+hub_model_id: voidful/Qwen3.5-35B-A3B-earica
+push_to_hub: true
+hub_strategy: end
+
+log_on_each_node: false
+logging_steps: 1

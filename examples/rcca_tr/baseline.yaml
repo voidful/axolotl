@@ -11,7 +11,7 @@ liger_glu_activation: true
 
 # Dataset
 datasets:
-  - path: voidful/earica_text_train
+  - path: voidful/earica_text_train_v2
     type: chat_template
     field_messages: conversations
     split: train
