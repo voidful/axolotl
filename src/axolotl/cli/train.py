@@ -60,6 +60,13 @@ def do_cli(config: Union[Path, str] = Path("examples/"), **kwargs):
         config: Path to `axolotl` config YAML file.
         kwargs: Additional keyword arguments to override config file values.
     """
+    import os
+    # Disable HuggingFace Hub network calls for all ranks except global rank 0 to prevent 429 Too Many Requests
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+    if rank != 0:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     parsed_cfg = load_cfg(config, **kwargs)
     parser = HfArgumentParser(TrainerCliArgs)
     parsed_cli_args, _ = parser.parse_args_into_dataclasses(
