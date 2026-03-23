@@ -152,8 +152,11 @@ def main():
     args = parser.parse_args()
 
     if args.merge_dir:
-        print(f"Merging cache chunks from {args.merge_dir} into {args.output_path}...")
+        import os
+        import torch
+        from tqdm import tqdm
         import glob
+        print(f"Merging cache chunks from {args.merge_dir} into {args.output_path}...")
         chunks = glob.glob(os.path.join(args.merge_dir, "prior_cache_rank_*.pt"))
         all_tgt, all_top1, all_mrgn = [], [], []
         # sort by rank numerically carefully
