@@ -323,11 +323,6 @@ def main():
                         bytes_read += n
                         
                 return t_bytes.view(dtype=dt).reshape(shape).clone()
-                    if n == 0:
-                        raise EOFError("Unexpected EOF while streaming safetensors")
-                    bytes_read += n
-                    
-            return t_bytes.view(dtype=dt).reshape(shape)
             
         def get_slice(self, key):
             # Evaluate eagerly since we stream directly to RAM
@@ -382,28 +377,28 @@ def main():
                 local_model_path,  # Use local path, NOT HF repo ID
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                 attn_implementation="sdpa",
-                 local_files_only=True,  # Force local-only, no HF Hub resolution
-                 low_cpu_mem_usage=True, # Critical for ZeRO-3
-+                ignore_mismatched_sizes=True, # Prevent shape mismatch failures
-             )
-         print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
-     except ImportError:
-         # Fallback to device_map if deepspeed is not installed
-         print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
-         model = AutoModelForCausalLM.from_pretrained(
-             local_model_path,
-             torch_dtype=torch.bfloat16,
-             device_map={"": local_rank},
-             trust_remote_code=True,
-             attn_implementation="sdpa",
-             local_files_only=True,
-             low_cpu_mem_usage=True,
-+            ignore_mismatched_sizes=True,
-         )
-        model.eval()
-        import gc
-        gc.collect()
+                attn_implementation="sdpa",
+                local_files_only=True,  # Force local-only, no HF Hub resolution
+                low_cpu_mem_usage=True,  # Critical for ZeRO-3
+                ignore_mismatched_sizes=True,  # Prevent shape mismatch failures
+            )
+        print(f"[Rank {rank}] Model loaded successfully via ZeRO-3 Init!")
+    except ImportError:
+        # Fallback to device_map if deepspeed is not installed
+        print(f"[Rank {rank}] WARNING: deepspeed not found, falling back to device_map. May OOM on Lustre.")
+        model = AutoModelForCausalLM.from_pretrained(
+            local_model_path,
+            torch_dtype=torch.bfloat16,
+            device_map={"": local_rank},
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            ignore_mismatched_sizes=True,
+        )
+    model.eval()
+    import gc
+    gc.collect()
 
     print(f"[Rank {rank}/{world_size}] Model loaded successfully!")
 
