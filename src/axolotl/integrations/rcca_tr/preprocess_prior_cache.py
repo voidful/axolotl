@@ -234,6 +234,8 @@ def main():
                  ds_config["train_micro_batch_size_per_gpu"] = 1
              if ds_config.get("train_batch_size") == "auto":
                  ds_config["train_batch_size"] = 1
+             if ds_config.get("gradient_accumulation_steps") == "auto":
+                 ds_config["gradient_accumulation_steps"] = 1
         else:
              # minimal inline config if file not found
              ds_config = {"train_micro_batch_size_per_gpu": 1, "train_batch_size": 1, "zero_optimization": {"stage": 3}}
