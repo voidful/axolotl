@@ -253,6 +253,18 @@ def main():
                     t = t.to(self.device)
                 return t
 
+            def get_slice(self, name):
+                """Return a lazy slice object compatible with transformers' usage."""
+                tensor = self.get_tensor(name)
+                class _TensorSlice:
+                    def __init__(self, t):
+                        self._tensor = t
+                    def __getitem__(self, idx):
+                        return self._tensor[idx]
+                    def get_shape(self):
+                        return list(self._tensor.shape)
+                return _TensorSlice(tensor)
+
             def metadata(self):
                 return self._metadata
 
