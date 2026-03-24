@@ -46,6 +46,9 @@ class RCCATRArgs(BaseModel):
     rcca_tr_reliability_tau: float | None = (
         1.0  # temperature for sigmoid mapping of reliability score
     )
+    rcca_tr_self_tau: float | None = (
+        1.0  # temperature for self-paced curriculum sharpness
+    )
 
     # --- Trust-region hyperparameters ---
     rcca_tr_epsilon_min: float | None = 0.01  # minimum trust-region radius
@@ -78,6 +81,7 @@ class RCCATRTrainingArgsMixin:
     rcca_tr_conflict_tau: float | None = 1.0
     rcca_tr_reliability_beta: float | None = 0.5
     rcca_tr_reliability_tau: float | None = 1.0
+    rcca_tr_self_tau: float | None = 1.0
     rcca_tr_epsilon_min: float | None = 0.01
     rcca_tr_epsilon_max: float | None = 1.0
     rcca_tr_kl_lambda: float | None = 1.0

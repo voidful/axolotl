@@ -20,12 +20,13 @@ A+ uses cached prior values instead of live frozen model forward passes:
   - Drift-based evidence reliability instead of EMA model comparison
   - Trust-region loss with KL proxy from cached prior logp
 
-The method uses two token-level signals:
+The method uses three token-level signals:
   1. Conflict score (α_t): whether the supervision challenges the prior.
-  2. Reliability score (r_t): whether the prior is stable and trustworthy.
+  2. Self-paced score (s_t): whether the token is learnable right now.
+  3. Reliability score (r_t): whether the prior is stable and trustworthy.
 
-These combine into a trust-region objective:
-  L_t = α_t · CE_t + λ · g(r_t) · CE_t  (weighted form)
+These combine into a dual-branch trust-region objective:
+  L_t = α_t · s_t · CE_t + λ · g(r_t) · KL_proxy_t
 """
 
 import torch
@@ -121,41 +122,78 @@ def compute_reliability_from_drift(
     return r_t
 
 
+def compute_self_paced_score(
+    active_target_logp: torch.Tensor,
+    valid_mask: torch.Tensor,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute self-paced token learnability score based on active model confidence.
+
+    Tokens that the model currently predicts well (high log p) get a higher
+    score, indicating they are "on-manifold" and stable to learn from.
+    Tokens with very low confidence are down-weighted as potentially noisy
+    or too difficult for the current training stage.
+
+    s_t = sigmoid((log p_θ(y_t) - μ) / τ)
+
+    Args:
+        active_target_logp: Log p_θ(y_t) from active model, shape (B, T).
+        valid_mask: Boolean mask for valid tokens, shape (B, T).
+        tau: Temperature for self-paced curriculum sharpness.
+
+    Returns:
+        s_t: Self-paced scores in [0, 1], shape (B, T).
+    """
+    if valid_mask.any():
+        mu_v = active_target_logp[valid_mask].mean()
+    else:
+        mu_v = active_target_logp.mean()
+
+    normalized = (active_target_logp - mu_v) / tau
+    s_t = torch.sigmoid(normalized)
+    
+    # Zero out invalid positions
+    s_t = s_t * valid_mask.float()
+
+    return s_t
+
+
 def compute_trust_region_loss_cached(
     active_logits: torch.Tensor,
     labels: torch.Tensor,
     alpha_t: torch.Tensor,
     r_t: torch.Tensor,
     prior_target_logp: torch.Tensor,
+    s_t: torch.Tensor | None = None,
     kl_lambda: float = 1.0,
     epsilon_min: float = 0.01,
     epsilon_max: float = 1.0,
     use_smooth: bool = True,
-    num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute trust-region loss using cached prior values (A+ variant).
 
-    Smooth form:
-        L_t = α_t · CE_t + λ · g(r_t) · KL_proxy_t
+    Dual-branch form:
+        L_t = α_t · s_t · CE_t + λ · g(r_t) · KL_proxy_t
 
-    Where KL_proxy_t = CE(p_θ, y_t) - (-prior_target_logp)
-                     = -log p_θ(y_t) + log p_0(y_t)
-
-    This is the difference in surprisal between the active and frozen models,
-    which approximates the KL divergence at the target token.
+    Where:
+        α_t: conflict score — does the supervision challenge the prior?
+        s_t: self-paced score — is this token learnable right now?
+        r_t: prior-aware reliability — should the prior knowledge be protected?
+        KL_proxy_t = -log p_θ(y_t) + log p_0(y_t)
 
     Args:
         active_logits: Logits from active model, shape (B, T, V).
         labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
         alpha_t: Conflict scores, shape (B, T).
-        r_t: Reliability scores, shape (B, T).
+        r_t: Prior-aware reliability scores, shape (B, T).
         prior_target_logp: Cached log p_0(y_t), shape (B, T).
+        s_t: Self-paced score for CE branch, shape (B, T). None = 1.0.
         kl_lambda: Lagrange multiplier for KL term.
         epsilon_min: Min trust-region radius (hinge only).
         epsilon_max: Max trust-region radius (hinge only).
         use_smooth: If True, smooth form; otherwise hinge.
-        num_items_in_batch: For sample packing normalization.
 
     Returns:
         Tuple of (scalar loss, active_target_logp for drift buffer update).
@@ -168,6 +206,7 @@ def compute_trust_region_loss_cached(
     shift_alpha = alpha_t[..., 1:].contiguous()
     shift_r = r_t[..., 1:].contiguous()
     shift_prior_logp = prior_target_logp[..., 1:].contiguous()
+    shift_s = s_t[..., 1:].contiguous() if s_t is not None else 1.0
 
     vocab_size = shift_logits.size(-1)
 
@@ -178,8 +217,8 @@ def compute_trust_region_loss_cached(
         shift_safe_labels.view(-1),
     ).view(shift_labels.shape)  # (B, T-1)
 
-    # Weighted by conflict score
-    weighted_ce = shift_alpha * per_token_ce * shift_mask.float()
+    # Weighted by prioritization: conflict score (alpha_t) and self-calibrated confidence (s_t)
+    weighted_ce = shift_alpha * shift_s * per_token_ce * shift_mask.float()
 
     # KL proxy: -log p_θ(y_t) - (-log p_0(y_t)) = CE_θ - surprisal_0
     # = per_token_ce + prior_target_logp (since prior_target_logp = log p_0)
@@ -197,11 +236,9 @@ def compute_trust_region_loss_cached(
     # Combine
     total_per_token = weighted_ce + kl_term
 
-    if num_items_in_batch is not None:
-        loss = total_per_token.sum() / num_items_in_batch
-    else:
-        num_valid = shift_mask.float().sum().clamp(min=1.0)
-        loss = total_per_token.sum() / num_valid
+    # Normalize by shifted valid token count (mathematically consistent with shifted loss)
+    num_valid = shift_mask.float().sum().clamp(min=1.0)
+    loss = total_per_token.sum() / num_valid
 
     # Compute active model's log p(y_t) for drift buffer
     active_log_probs = F.log_softmax(shift_logits.detach(), dim=-1)

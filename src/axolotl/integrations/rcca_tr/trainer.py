@@ -21,8 +21,9 @@ The EMA model is replaced by a lightweight drift buffer.
 
 On each step, it computes:
   - Conflict score α_t from cached prior values (no frozen forward)
+  - Self-paced score s_t from active model confidence
   - Drift-based reliability r_t (no EMA forward)
-  - Trust-region loss: α_t · CE + λ · g(r_t) · KL_proxy
+  - Trust-region loss: α_t · s_t · CE + λ · g(r_t) · KL_proxy
 """
 
 import torch
@@ -36,6 +37,7 @@ from .drift import DriftBuffer
 from .loss import (
     compute_conflict_score_from_cache,
     compute_reliability_from_drift,
+    compute_self_paced_score,
     compute_trust_region_loss_cached,
 )
 
@@ -96,9 +98,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         ):
             del inputs["attention_mask"]
 
-        if num_items_in_batch is None and "labels" in inputs:
-            num_items_in_batch = (inputs["labels"] != -100).sum().item()
-
         # Pop RCCA-TR fields before model forward (model doesn't accept them)
         prior_target_logp = inputs.pop("prior_target_logp", None)
         prior_margin = inputs.pop("prior_margin", None)
@@ -142,46 +141,61 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         # 2. Compute drift-based reliability using previous running average
         # Get active model's log p(y_t) for drift estimation
+        # CRITICAL: active_logits[b, t] predicts token at position t+1 (next-token).
+        # To get log p_θ(y_t | x, y_{<t}), we need logits at position t-1 aligned
+        # with label at position t. This matches prior_target_logp's convention.
         with torch.no_grad():
-            active_log_probs = F.log_softmax(active_logits, dim=-1)
-            safe_labels = labels.clamp(min=0)
-            active_target_logp = active_log_probs.gather(
-                dim=-1, index=safe_labels.unsqueeze(-1)
-            ).squeeze(-1)  # (B, T)
-            active_target_logp = active_target_logp * valid_mask.float()
+            shift_active_log_probs = F.log_softmax(active_logits[..., :-1, :], dim=-1)  # (B, T-1, V)
+            shift_labels_for_gather = labels[..., 1:].clamp(min=0)  # (B, T-1)
+            shift_valid = (labels[..., 1:] != -100)
+            active_target_logp_shifted = shift_active_log_probs.gather(
+                dim=-1, index=shift_labels_for_gather.unsqueeze(-1)
+            ).squeeze(-1)  # (B, T-1)
+            active_target_logp_shifted = active_target_logp_shifted * shift_valid.float()
+            # Pad position 0 with 0.0 to restore shape (B, T), matching prior_target_logp
+            active_target_logp = F.pad(active_target_logp_shifted, (1, 0), value=0.0)
+            # Build matching valid mask: position 0 is ALWAYS invalid (no next-token prediction exists)
+            shifted_valid_mask = F.pad(shift_valid, (1, 0), value=False)
 
         drift = self.drift_buffer.get_current_drift(
             active_target_logp=active_target_logp,
             prior_target_logp=prior_target_logp,
-            valid_mask=valid_mask,
+            valid_mask=shifted_valid_mask,
         )
 
-        r_t = compute_reliability_from_drift(
+        r_t_prior = compute_reliability_from_drift(
             drift=drift,
-            valid_mask=valid_mask,
+            valid_mask=shifted_valid_mask,
             gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
             tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
         )
 
-        # 3. Compute trust-region loss with KL proxy
+        s_t = compute_self_paced_score(
+            active_target_logp=active_target_logp,
+            valid_mask=shifted_valid_mask,
+            tau=getattr(self.args, "rcca_tr_self_tau", 1.0) or 1.0,
+        )
+
+        # 3. Compute trust-region loss with dual-branch control
+        # r_t_prior dictates trust-region strength (KL). s_t dictates self-paced learning speed (CE).
         loss, _ = compute_trust_region_loss_cached(
             active_logits=active_logits,
             labels=labels,
             alpha_t=alpha_t,
-            r_t=r_t,
+            r_t=r_t_prior,
             prior_target_logp=prior_target_logp,
+            s_t=s_t,
             kl_lambda=getattr(self.args, "rcca_tr_kl_lambda", 1.0) or 1.0,
             epsilon_min=getattr(self.args, "rcca_tr_epsilon_min", 0.01) or 0.01,
             epsilon_max=getattr(self.args, "rcca_tr_epsilon_max", 1.0) or 1.0,
             use_smooth=getattr(self.args, "rcca_tr_use_smooth_objective", True),
-            num_items_in_batch=num_items_in_batch,
         )
 
         # 4. Update drift buffer with this step's values
         self.drift_buffer.step(
             active_target_logp=active_target_logp,
             prior_target_logp=prior_target_logp,
-            valid_mask=valid_mask,
+            valid_mask=shifted_valid_mask,
         )
 
         return (loss, outputs) if return_outputs else loss
