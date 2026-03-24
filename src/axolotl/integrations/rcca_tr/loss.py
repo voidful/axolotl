@@ -13,339 +13,256 @@
 # limitations under the License.
 
 """
-Core loss functions for RCCA-TR A+ variant.
+Core loss functions for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
 
-A+ uses cached prior values instead of live frozen model forward passes:
-  - Conflict score from cached prior_target_logp and prior_margin
-  - Drift-based evidence reliability instead of EMA model comparison
-  - Trust-region loss with KL proxy from cached prior logp
+We suppress high-perplexity tokens by default, but rescue those that
+consistently improve the model's confidence on the supervised target
+relative to the frozen prior.
 
-The method uses three token-level signals:
-  1. Conflict score (α_t): whether the supervision challenges the prior.
-  2. Self-paced score (s_t): whether the token is learnable right now.
-  3. Reliability score (r_t): whether the prior is stable and trustworthy.
+Three orthogonal token-level gates:
+  1. Challenge gate (α_t): does this token challenge the frozen prior?
+  2. Hardness gate (h_t): is this token hard enough to warrant suppression?
+  3. Useful-hard gate (q_t): does this hard token have positive improvement evidence?
 
-These combine into a dual-branch trust-region objective:
-  L_t = α_t · s_t · CE_t + λ · g(r_t) · KL_proxy_t
+These combine into a single unified weight:
+  w_t = α_t · [w_min + (1 - w_min) · (1 - h_t · (1 - q_t))]
+
+Final loss:
+  L = Σ w_t · CE_t / |V|
 """
 
 import torch
 import torch.nn.functional as F
 
 
-def compute_conflict_score_from_cache(
+# =====================================================================
+# Gate computations
+# =====================================================================
+
+
+def compute_challenge_gate(
     prior_target_logp: torch.Tensor,
     prior_margin: torch.Tensor,
     valid_mask: torch.Tensor,
     lambda1: float = 1.0,
     lambda2: float = 0.5,
-    tau: float = 1.0,
-    eps: float = 1e-8,
+    tau_c: float = 1.0,
 ) -> torch.Tensor:
     """
-    Compute token-level conflict score α_t from cached prior values.
+    Challenge gate: does this token challenge the frozen prior?
 
-    c_t^full = λ1 * (-log p_0(y_t)) + λ2 * margin_t
-    α_t = σ((c_t - μ) / τ)
+    α_t = σ((c_t − μ_c) / τ_c)
+
+    where c_t = λ₁ · (−log p₀(y_t)) + λ₂ · margin_t
+
+    High α_t → the supervision strongly contradicts the prior.
+    Low α_t  → the prior already agrees with the target.
 
     Args:
-        prior_target_logp: Cached log p_0(y_t), shape (B, T).
-        prior_margin: Cached log p_0(ŷ^(1)) - log p_0(y_t), shape (B, T).
+        prior_target_logp: Cached log p₀(y_t), shape (B, T).
+        prior_margin: Cached log p₀(top1) − log p₀(y_t), shape (B, T).
         valid_mask: Boolean mask for valid tokens, shape (B, T).
-        lambda1: Weight for surprisal component.
+        lambda1: Weight for prior surprisal component.
         lambda2: Weight for margin component.
-        tau: Temperature for sigmoid mapping.
-        eps: Numerical stability constant.
+        tau_c: Temperature for sigmoid mapping.
 
     Returns:
-        alpha_t: Conflict scores in [0, 1], shape (B, T).
+        α_t: Challenge scores in [0, 1], shape (B, T).
     """
-    # Surprisal = -log p_0(y_t)
-    surprisal = -prior_target_logp  # (B, T)
+    surprisal_prior = -prior_target_logp  # s_t^(0)
+    c_t = lambda1 * surprisal_prior + lambda2 * prior_margin
 
-    # Combined conflict
-    conflict_raw = lambda1 * surprisal + lambda2 * prior_margin  # (B, T)
-
-    # Normalize across valid tokens (z-score)
     if valid_mask.any():
-        valid_values = conflict_raw[valid_mask]
-        mu = valid_values.mean()
-        sigma = valid_values.std() + eps
-        conflict_normalized = (conflict_raw - mu) / sigma
+        mu_c = c_t[valid_mask].mean()
     else:
-        conflict_normalized = conflict_raw
+        mu_c = c_t.mean()
 
-    # Map to [0, 1] via sigmoid
-    alpha_t = torch.sigmoid(conflict_normalized / tau)
-
-    # Zero out invalid positions
-    alpha_t = alpha_t * valid_mask.float()
-
-    return alpha_t
+    alpha_t = torch.sigmoid((c_t - mu_c) / tau_c)
+    return alpha_t * valid_mask.float()
 
 
-def compute_reliability_from_drift(
-    drift: torch.Tensor,
+def compute_hardness_gate(
+    ce_t: torch.Tensor,
     valid_mask: torch.Tensor,
-    gamma: float = 1.0,
-    tau: float = 1.0,
+    tau_p: float = 2.0,
+    T_p: float = 1.0,
 ) -> torch.Tensor:
     """
-    Compute combined reliability from drift buffer.
+    Hardness gate: is this token hard enough to warrant default suppression?
 
-    In A+, stability is not computed (no perturbation passes).
-    Reliability comes purely from evidence drift:
-        r_evi = exp(-γ * d_t)
-        r_t = σ((r_evi - μ) / τ)
+    h_t = σ((u_t − τ_p) / T_p)    where u_t = CE_t
+
+    High h_t → token is hard, should be suppressed by default.
+    Low h_t  → token is easy, no suppression needed.
 
     Args:
-        drift: Per-token drift values, shape (B, T).
+        ce_t: Per-token cross-entropy, shape (B, T).
         valid_mask: Boolean mask for valid tokens, shape (B, T).
-        gamma: Scaling factor for drift → reliability.
-        tau: Temperature for sigmoid normalization.
+        tau_p: Hardness threshold (perplexity level above which suppression kicks in).
+        T_p: Temperature for sigmoid smoothing.
 
     Returns:
-        r_t: Reliability scores in [0, 1], shape (B, T).
+        h_t: Hardness scores in [0, 1], shape (B, T).
     """
-    r_evi = torch.exp(-gamma * drift)
-
-    # Center and normalize — only over valid (non-padding) tokens
-    if valid_mask.any():
-        mu = r_evi[valid_mask].mean()
-    else:
-        mu = r_evi.mean()
-    normalized = (r_evi - mu) / tau
-
-    r_t = torch.sigmoid(normalized)
-    r_t = r_t * valid_mask.float()
-
-    return r_t
+    h_t = torch.sigmoid((ce_t - tau_p) / T_p)
+    return h_t * valid_mask.float()
 
 
-def compute_self_paced_score(
-    active_target_logp: torch.Tensor,
+def compute_useful_hard_gate(
+    delta_plus: torch.Tensor,
     valid_mask: torch.Tensor,
-    tau: float = 1.0,
+    tau_delta: float = 0.8,
+    T_delta: float = 1.0,
 ) -> torch.Tensor:
     """
-    Compute self-paced token learnability score based on active model confidence.
+    Useful-hard gate: does this hard token provide positive improvement evidence?
 
-    Tokens that the model currently predicts well (high log p) get a higher
-    score, indicating they are "on-manifold" and stable to learn from.
-    Tokens with very low confidence are down-weighted as potentially noisy
-    or too difficult for the current training stage.
+    q_t = σ((Δ_t⁺ − τ_Δ) / T_Δ)
 
-    s_t = sigmoid((log p_θ(y_t) - μ) / τ)
+    where Δ_t⁺ = max(0, log p_θ(y_t) − log p₀(y_t))
+
+    High q_t → active model is more confident than prior on gold token → rescue.
+    Low q_t  → no improvement evidence → keep suppressed.
 
     Args:
-        active_target_logp: Log p_θ(y_t) from active model, shape (B, T).
+        delta_plus: Directional improvement Δ_t⁺, shape (B, T).
         valid_mask: Boolean mask for valid tokens, shape (B, T).
-        tau: Temperature for self-paced curriculum sharpness.
+        tau_delta: Improvement threshold.
+        T_delta: Temperature for sigmoid smoothing.
 
     Returns:
-        s_t: Self-paced scores in [0, 1], shape (B, T).
+        q_t: Useful-hard scores in [0, 1], shape (B, T).
     """
-    if valid_mask.any():
-        mu_v = active_target_logp[valid_mask].mean()
-    else:
-        mu_v = active_target_logp.mean()
-
-    normalized = (active_target_logp - mu_v) / tau
-    s_t = torch.sigmoid(normalized)
-    
-    # Zero out invalid positions
-    s_t = s_t * valid_mask.float()
-
-    return s_t
+    q_t = torch.sigmoid((delta_plus - tau_delta) / T_delta)
+    return q_t * valid_mask.float()
 
 
-def compute_trust_region_loss_cached(
+def compute_token_weights(
+    alpha_t: torch.Tensor,
+    h_t: torch.Tensor,
+    q_t: torch.Tensor,
+    w_min: float = 0.05,
+) -> torch.Tensor:
+    """
+    Compute final per-token weight for CE loss.
+
+    w_t = α_t · [w_min + (1 − w_min) · (1 − h_t · (1 − q_t))]
+
+    Behavior:
+      - Easy token (h≈0):           inner ≈ 1   → w ≈ α_t
+      - Hard + useless (h≈1, q≈0):  inner ≈ w_min → w ≈ α_t · w_min
+      - Hard + useful (h≈1, q≈1):   inner ≈ 1   → w ≈ α_t  (rescued)
+
+    Args:
+        alpha_t: Challenge gate, shape (B, T).
+        h_t: Hardness gate, shape (B, T).
+        q_t: Useful-hard gate, shape (B, T).
+        w_min: Weight floor to prevent zero gradients.
+
+    Returns:
+        w_t: Final per-token weights, shape (B, T).
+    """
+    inner = w_min + (1.0 - w_min) * (1.0 - h_t * (1.0 - q_t))
+    return alpha_t * inner
+
+
+# =====================================================================
+# Main loss function
+# =====================================================================
+
+
+def compute_weighted_ce_loss(
     active_logits: torch.Tensor,
     labels: torch.Tensor,
-    alpha_t: torch.Tensor,
-    r_t: torch.Tensor,
     prior_target_logp: torch.Tensor,
-    s_t: torch.Tensor | None = None,
-    kl_lambda: float = 1.0,
-    epsilon_min: float = 0.01,
-    epsilon_max: float = 1.0,
-    use_smooth: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    prior_margin: torch.Tensor,
+    lambda1: float = 1.0,
+    lambda2: float = 0.5,
+    tau_c: float = 1.0,
+    tau_p: float = 2.0,
+    T_p: float = 1.0,
+    tau_delta: float = 0.8,
+    T_delta: float = 1.0,
+    w_min: float = 0.05,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Compute trust-region loss using cached prior values (A+ variant).
+    Compute the RCCA-TR weighted CE loss: suppress-by-default, rescue-if-useful.
 
-    Dual-branch form:
-        L_t = α_t · s_t · CE_t + λ · g(r_t) · KL_proxy_t
+    L = Σ w_t · CE_t / |V|
 
-    Where:
-        α_t: conflict score — does the supervision challenge the prior?
-        s_t: self-paced score — is this token learnable right now?
-        r_t: prior-aware reliability — should the prior knowledge be protected?
-        KL_proxy_t = -log p_θ(y_t) + log p_0(y_t)
+    w_t = α_t · [w_min + (1 − w_min) · (1 − h_t · (1 − q_t))]
+
+    All shifting for next-token prediction is handled internally.
 
     Args:
         active_logits: Logits from active model, shape (B, T, V).
         labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
-        alpha_t: Conflict scores, shape (B, T).
-        r_t: Prior-aware reliability scores, shape (B, T).
-        prior_target_logp: Cached log p_0(y_t), shape (B, T).
-        s_t: Self-paced score for CE branch, shape (B, T). None = 1.0.
-        kl_lambda: Lagrange multiplier for KL term.
-        epsilon_min: Min trust-region radius (hinge only).
-        epsilon_max: Max trust-region radius (hinge only).
-        use_smooth: If True, smooth form; otherwise hinge.
+        prior_target_logp: Cached log p₀(y_t), shape (B, T).
+        prior_margin: Cached log p₀(top1) − log p₀(y_t), shape (B, T).
+        lambda1: Weight for prior surprisal in challenge score.
+        lambda2: Weight for margin in challenge score.
+        tau_c: Temperature for challenge gate.
+        tau_p: Hardness threshold.
+        T_p: Hardness temperature.
+        tau_delta: Improvement evidence threshold.
+        T_delta: Improvement evidence temperature.
+        w_min: Weight floor.
 
     Returns:
-        Tuple of (scalar loss, active_target_logp for drift buffer update).
+        Tuple of (scalar loss, dict of intermediate tensors for logging/EMA update).
     """
     # Shift for next-token prediction
     shift_logits = active_logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
-    shift_safe_labels = shift_labels.clamp(min=0)
-    shift_mask = shift_labels != -100
-    shift_alpha = alpha_t[..., 1:].contiguous()
-    shift_r = r_t[..., 1:].contiguous()
     shift_prior_logp = prior_target_logp[..., 1:].contiguous()
-    shift_s = s_t[..., 1:].contiguous() if s_t is not None else 1.0
+    shift_prior_margin = prior_margin[..., 1:].contiguous()
 
-    vocab_size = shift_logits.size(-1)
+    shift_mask = shift_labels != -100
+    shift_safe_labels = shift_labels.clamp(min=0)
 
-    # Per-token CE loss
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-    per_token_ce = ce_loss_fn(
-        shift_logits.view(-1, vocab_size),
-        shift_safe_labels.view(-1),
-    ).view(shift_labels.shape)  # (B, T-1)
-
-    # Weighted by prioritization: conflict score (alpha_t) and self-calibrated confidence (s_t)
-    weighted_ce = shift_alpha * shift_s * per_token_ce * shift_mask.float()
-
-    # KL proxy: -log p_θ(y_t) - (-log p_0(y_t)) = CE_θ - surprisal_0
-    # = per_token_ce + prior_target_logp (since prior_target_logp = log p_0)
-    kl_proxy = (per_token_ce + shift_prior_logp).clamp(min=0.0)  # (B, T-1)
-
-    if use_smooth:
-        # Smooth: λ · g(r_t) · KL_proxy
-        kl_term = kl_lambda * shift_r * kl_proxy * shift_mask.float()
-    else:
-        # Hinge: λ · max(0, KL_proxy - ε_t)
-        epsilon_t = epsilon_max - shift_r * (epsilon_max - epsilon_min)
-        kl_hinge = torch.clamp(kl_proxy - epsilon_t, min=0.0)
-        kl_term = kl_lambda * kl_hinge * shift_mask.float()
-
-    # Combine
-    total_per_token = weighted_ce + kl_term
-
-    # Normalize by shifted valid token count (mathematically consistent with shifted loss)
-    num_valid = shift_mask.float().sum().clamp(min=1.0)
-    loss = total_per_token.sum() / num_valid
-
-    # Compute active model's log p(y_t) for drift buffer
-    active_log_probs = F.log_softmax(shift_logits.detach(), dim=-1)
-    active_target_logp_shifted = active_log_probs.gather(
+    # Per-token CE and log-prob
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    per_token_logp = log_probs.gather(
         dim=-1, index=shift_safe_labels.unsqueeze(-1)
     ).squeeze(-1)  # (B, T-1)
-    active_target_logp_shifted = active_target_logp_shifted * shift_mask.float()
+    ce_t = -per_token_logp  # (B, T-1)
 
-    return loss, active_target_logp_shifted
+    # Mask invalid positions
+    active_target_logp = per_token_logp * shift_mask.float()
 
+    # --- Gate 1: Challenge α_t ---
+    alpha_t = compute_challenge_gate(
+        shift_prior_logp, shift_prior_margin, shift_mask,
+        lambda1, lambda2, tau_c,
+    )
 
-# ===== Legacy functions kept for backward compatibility =====
+    # --- Gate 2: Hardness h_t ---
+    h_t = compute_hardness_gate(ce_t, shift_mask, tau_p, T_p)
 
+    # --- Gate 3: Useful-hard q_t ---
+    # Directional improvement: Δ_t⁺ = max(0, log p_θ − log p₀)
+    instant_delta_plus = (active_target_logp - shift_prior_logp).clamp(min=0.0)
+    instant_delta_plus = instant_delta_plus * shift_mask.float()
 
-def compute_conflict_score(
-    frozen_logits: torch.Tensor,
-    labels: torch.Tensor,
-    lambda1: float = 1.0,
-    lambda2: float = 0.5,
-    tau: float = 1.0,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    Compute conflict score from full frozen logits (legacy, for testing).
-    """
-    frozen_log_probs = F.log_softmax(frozen_logits, dim=-1)
-    valid_mask = labels != -100
-    safe_labels = labels.clamp(min=0)
+    q_t = compute_useful_hard_gate(instant_delta_plus, shift_mask, tau_delta, T_delta)
 
-    gt_log_probs = frozen_log_probs.gather(
-        dim=-1, index=safe_labels.unsqueeze(-1)
-    ).squeeze(-1)
-    surprisal = -gt_log_probs
-    top1_log_probs = frozen_log_probs.max(dim=-1).values
-    margin = top1_log_probs - gt_log_probs
+    # --- Final weight ---
+    w_t = compute_token_weights(alpha_t, h_t, q_t, w_min)
 
-    conflict_raw = lambda1 * surprisal + lambda2 * margin
+    # --- Weighted CE loss ---
+    weighted_ce = w_t * ce_t * shift_mask.float()
+    num_valid = shift_mask.float().sum().clamp(min=1.0)
+    loss = weighted_ce.sum() / num_valid
 
-    if valid_mask.any():
-        valid_values = conflict_raw[valid_mask]
-        mu = valid_values.mean()
-        sigma = valid_values.std() + eps
-        conflict_normalized = (conflict_raw - mu) / sigma
-    else:
-        conflict_normalized = conflict_raw
+    # Return intermediates for logging and optional EMA update
+    intermediates = {
+        "active_target_logp": active_target_logp,  # (B, T-1), shifted
+        "instant_delta_plus": instant_delta_plus,   # (B, T-1), shifted
+        "shift_mask": shift_mask,                   # (B, T-1)
+        "alpha_t": alpha_t,                         # (B, T-1)
+        "h_t": h_t,                                 # (B, T-1)
+        "q_t": q_t,                                 # (B, T-1)
+        "w_t": w_t,                                 # (B, T-1)
+    }
 
-    alpha_t = torch.sigmoid(conflict_normalized / tau)
-    alpha_t = alpha_t * valid_mask.float()
-    return alpha_t
-
-
-def compute_trust_region_loss(
-    active_logits: torch.Tensor,
-    frozen_logits: torch.Tensor,
-    labels: torch.Tensor,
-    alpha_t: torch.Tensor,
-    r_t: torch.Tensor,
-    kl_lambda: float = 1.0,
-    epsilon_min: float = 0.01,
-    epsilon_max: float = 1.0,
-    use_smooth: bool = True,
-    num_items_in_batch: int | None = None,
-) -> torch.Tensor:
-    """
-    Legacy trust-region loss with full frozen logits (for backward compat / testing).
-    """
-    valid_mask = labels != -100
-    safe_labels = labels.clamp(min=0)
-
-    shift_logits = active_logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    shift_safe_labels = shift_labels.clamp(min=0)
-    shift_mask = shift_labels != -100
-    shift_alpha = alpha_t[..., 1:].contiguous()
-    shift_r = r_t[..., 1:].contiguous()
-
-    vocab_size = shift_logits.size(-1)
-
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-    per_token_ce = ce_loss_fn(
-        shift_logits.view(-1, vocab_size),
-        shift_safe_labels.view(-1),
-    ).view(shift_labels.shape)
-
-    weighted_ce = shift_alpha * per_token_ce * shift_mask.float()
-
-    shift_frozen_logits = frozen_logits[..., :-1, :].contiguous()
-    active_log_probs = F.log_softmax(shift_logits, dim=-1)
-    frozen_log_probs = F.log_softmax(shift_frozen_logits, dim=-1)
-    active_probs = F.softmax(shift_logits, dim=-1)
-
-    per_token_kl = (active_probs * (active_log_probs - frozen_log_probs)).sum(dim=-1)
-    per_token_kl = per_token_kl.clamp(min=0.0)
-
-    if use_smooth:
-        kl_term = kl_lambda * shift_r * per_token_kl * shift_mask.float()
-    else:
-        epsilon_t = epsilon_max - shift_r * (epsilon_max - epsilon_min)
-        kl_hinge = torch.clamp(per_token_kl - epsilon_t, min=0.0)
-        kl_term = kl_lambda * kl_hinge * shift_mask.float()
-
-    total_per_token = weighted_ce + kl_term
-
-    if num_items_in_batch is not None:
-        loss = total_per_token.sum() / num_items_in_batch
-    else:
-        num_valid = shift_mask.float().sum().clamp(min=1.0)
-        loss = total_per_token.sum() / num_valid
-
-    return loss
+    return loss, intermediates

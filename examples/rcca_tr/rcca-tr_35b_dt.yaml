@@ -12,14 +12,11 @@ rcca_tr_trainer: true
 rcca_tr_conflict_lambda1: 1.0
 rcca_tr_conflict_lambda2: 0.5
 rcca_tr_conflict_tau: 1.0
-rcca_tr_reliability_beta: 0.5
-rcca_tr_reliability_tau: 1.0
-rcca_tr_epsilon_min: 0.01
-rcca_tr_epsilon_max: 1.0
-rcca_tr_kl_lambda: 1.0
-rcca_tr_use_smooth_objective: true
-rcca_tr_ema_decay: 0.999
-rcca_tr_drift_gamma: 1.0
+rcca_tr_tau_p: 2.0
+rcca_tr_T_p: 1.0
+rcca_tr_tau_delta: 0.8
+rcca_tr_T_delta: 1.0
+rcca_tr_w_min: 0.05
 rcca_tr_prior_cache_path: ./prior_cache/prior_cache_35b_dt.pt
 
 datasets:

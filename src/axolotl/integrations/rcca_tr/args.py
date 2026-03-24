@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Plugin args for RCCA-TR A+ variant.
+Plugin args for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
 """
 
 from dataclasses import dataclass
@@ -23,45 +23,41 @@ from pydantic import BaseModel
 
 class RCCATRArgs(BaseModel):
     """
-    Input args for RCCA-TR fine-tuning (A+ variant).
+    Input args for RCCA-TR fine-tuning.
     """
 
     rcca_tr_trainer: bool | None = None  # whether to use RCCA-TR trainer
 
-    # --- Conflict score hyperparameters ---
+    # --- Challenge gate (α_t) ---
     rcca_tr_conflict_lambda1: float | None = (
-        1.0  # weight for surprisal component in conflict score
+        1.0  # weight for prior surprisal component
     )
     rcca_tr_conflict_lambda2: float | None = (
         0.5  # weight for margin-based conflict component
     )
     rcca_tr_conflict_tau: float | None = (
-        1.0  # temperature for sigmoid mapping of conflict score
+        1.0  # temperature for challenge gate sigmoid
     )
 
-    # --- Reliability score hyperparameters ---
-    rcca_tr_reliability_beta: float | None = (
-        0.5  # balance between stability and evidence reliability
+    # --- Hardness gate (h_t) ---
+    rcca_tr_tau_p: float | None = (
+        2.0  # hardness threshold: CE level above which suppression kicks in
     )
-    rcca_tr_reliability_tau: float | None = (
-        1.0  # temperature for sigmoid mapping of reliability score
-    )
-    rcca_tr_self_tau: float | None = (
-        1.0  # temperature for self-paced curriculum sharpness
+    rcca_tr_T_p: float | None = (
+        1.0  # hardness sigmoid temperature
     )
 
-    # --- Trust-region hyperparameters ---
-    rcca_tr_epsilon_min: float | None = 0.01  # minimum trust-region radius
-    rcca_tr_epsilon_max: float | None = 1.0  # maximum trust-region radius
-    rcca_tr_kl_lambda: float | None = 1.0  # Lagrange multiplier for KL penalty
-    rcca_tr_use_smooth_objective: bool | None = (
-        True  # use smooth g(r_t)*KL vs hinge max(0, KL - epsilon_t)
+    # --- Useful-hard gate (q_t) ---
+    rcca_tr_tau_delta: float | None = (
+        0.8  # improvement threshold for Δ_t⁺
+    )
+    rcca_tr_T_delta: float | None = (
+        1.0  # improvement sigmoid temperature
     )
 
-    # --- Drift buffer (replaces EMA model) ---
-    rcca_tr_ema_decay: float | None = 0.999  # decay rate for drift buffer
-    rcca_tr_drift_gamma: float | None = (
-        1.0  # scaling factor for drift → reliability mapping
+    # --- Weight ---
+    rcca_tr_w_min: float | None = (
+        0.05  # weight floor to prevent zero gradients
     )
 
     # --- Prior cache ---
@@ -73,19 +69,15 @@ class RCCATRArgs(BaseModel):
 @dataclass
 class RCCATRTrainingArgsMixin:
     """
-    Additional training args for RCCA-TR (A+ variant).
+    Additional training args for RCCA-TR.
     """
 
     rcca_tr_conflict_lambda1: float | None = 1.0
     rcca_tr_conflict_lambda2: float | None = 0.5
     rcca_tr_conflict_tau: float | None = 1.0
-    rcca_tr_reliability_beta: float | None = 0.5
-    rcca_tr_reliability_tau: float | None = 1.0
-    rcca_tr_self_tau: float | None = 1.0
-    rcca_tr_epsilon_min: float | None = 0.01
-    rcca_tr_epsilon_max: float | None = 1.0
-    rcca_tr_kl_lambda: float | None = 1.0
-    rcca_tr_use_smooth_objective: bool | None = True
-    rcca_tr_ema_decay: float | None = 0.999
-    rcca_tr_drift_gamma: float | None = 1.0
+    rcca_tr_tau_p: float | None = 2.0
+    rcca_tr_T_p: float | None = 1.0
+    rcca_tr_tau_delta: float | None = 0.8
+    rcca_tr_T_delta: float | None = 1.0
+    rcca_tr_w_min: float | None = 0.05
     rcca_tr_prior_cache_path: str | None = None

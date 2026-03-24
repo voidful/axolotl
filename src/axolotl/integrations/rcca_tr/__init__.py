@@ -13,11 +13,12 @@
 # limitations under the License.
 
 """
-Plugin init for RCCA-TR A+ variant.
+Plugin init for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
 
-Provides token-wise adaptive trust-region fine-tuning with:
+Provides token-wise adaptive weighted CE fine-tuning with:
   - Offline prior cache (no live frozen model)
-  - Drift buffer (no live EMA model)
+  - Hardness gate h_t (suppress high-perplexity tokens)
+  - Useful-hard gate q_t (rescue tokens with positive improvement evidence)
   - Only the active model in GPU memory
 """
 
@@ -35,11 +36,10 @@ LOG = get_logger(__name__)
 
 class RCCATRPlugin(BasePlugin):
     """
-    Plugin for RCCA-TR A+ support in Axolotl.
+    Plugin for RCCA-TR support in Axolotl.
 
     Memory: ~1× model size (just the active model).
     Prior information is pre-computed offline and loaded as cached values.
-    Evidence drift is tracked via a lightweight statistical buffer.
     """
 
     def get_input_args(self):
@@ -60,14 +60,11 @@ class RCCATRPlugin(BasePlugin):
             "rcca_tr_conflict_lambda1": cfg.rcca_tr_conflict_lambda1,
             "rcca_tr_conflict_lambda2": cfg.rcca_tr_conflict_lambda2,
             "rcca_tr_conflict_tau": cfg.rcca_tr_conflict_tau,
-            "rcca_tr_reliability_beta": cfg.rcca_tr_reliability_beta,
-            "rcca_tr_reliability_tau": cfg.rcca_tr_reliability_tau,
-            "rcca_tr_epsilon_min": cfg.rcca_tr_epsilon_min,
-            "rcca_tr_epsilon_max": cfg.rcca_tr_epsilon_max,
-            "rcca_tr_kl_lambda": cfg.rcca_tr_kl_lambda,
-            "rcca_tr_use_smooth_objective": cfg.rcca_tr_use_smooth_objective,
-            "rcca_tr_ema_decay": cfg.rcca_tr_ema_decay,
-            "rcca_tr_drift_gamma": cfg.rcca_tr_drift_gamma,
+            "rcca_tr_tau_p": cfg.rcca_tr_tau_p,
+            "rcca_tr_T_p": cfg.rcca_tr_T_p,
+            "rcca_tr_tau_delta": cfg.rcca_tr_tau_delta,
+            "rcca_tr_T_delta": cfg.rcca_tr_T_delta,
+            "rcca_tr_w_min": cfg.rcca_tr_w_min,
             "rcca_tr_prior_cache_path": cfg.rcca_tr_prior_cache_path,
         }
 
