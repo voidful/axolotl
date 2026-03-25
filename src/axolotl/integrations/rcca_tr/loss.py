@@ -19,13 +19,12 @@ We suppress high-perplexity tokens by default, but rescue those that
 consistently improve the model's confidence on the supervised target
 relative to the frozen prior.
 
-Three orthogonal token-level gates:
-  1. Challenge gate (α_t): does this token challenge the frozen prior?
-  2. Hardness gate (h_t): is this token hard enough to warrant suppression?
-  3. Useful-hard gate (q_t): does this hard token have positive improvement evidence?
+Two orthogonal token-level gates:
+  1. Hardness gate (h_t): is this token hard enough to warrant suppression?
+  2. Useful-hard gate (q_t): does this hard token have positive improvement evidence?
 
 These combine into a single unified weight:
-  w_t = α_t · [w_min + (1 - w_min) · (1 - h_t · (1 - q_t))]
+  w_t = w_min + (1 - w_min) · (1 - h_t · (1 - q_t))
 
 Final loss:
   L = Σ w_t · CE_t / |V|
@@ -38,47 +37,6 @@ import torch.nn.functional as F
 # =====================================================================
 # Gate computations
 # =====================================================================
-
-
-def compute_challenge_gate(
-    prior_target_logp: torch.Tensor,
-    prior_margin: torch.Tensor,
-    valid_mask: torch.Tensor,
-    lambda1: float = 1.0,
-    lambda2: float = 0.5,
-    tau_c: float = 1.0,
-) -> torch.Tensor:
-    """
-    Challenge gate: does this token challenge the frozen prior?
-
-    α_t = σ((c_t − μ_c) / τ_c)
-
-    where c_t = λ₁ · (−log p₀(y_t)) + λ₂ · margin_t
-
-    High α_t → the supervision strongly contradicts the prior.
-    Low α_t  → the prior already agrees with the target.
-
-    Args:
-        prior_target_logp: Cached log p₀(y_t), shape (B, T).
-        prior_margin: Cached log p₀(top1) − log p₀(y_t), shape (B, T).
-        valid_mask: Boolean mask for valid tokens, shape (B, T).
-        lambda1: Weight for prior surprisal component.
-        lambda2: Weight for margin component.
-        tau_c: Temperature for sigmoid mapping.
-
-    Returns:
-        α_t: Challenge scores in [0, 1], shape (B, T).
-    """
-    surprisal_prior = -prior_target_logp  # s_t^(0)
-    c_t = lambda1 * surprisal_prior + lambda2 * prior_margin
-
-    if valid_mask.any():
-        mu_c = c_t[valid_mask].mean()
-    else:
-        mu_c = c_t.mean()
-
-    alpha_t = torch.sigmoid((c_t - mu_c) / tau_c)
-    return alpha_t * valid_mask.float()
 
 
 def compute_hardness_gate(
@@ -138,7 +96,6 @@ def compute_useful_hard_gate(
 
 
 def compute_token_weights(
-    alpha_t: torch.Tensor,
     h_t: torch.Tensor,
     q_t: torch.Tensor,
     w_min: float = 0.05,
@@ -146,15 +103,14 @@ def compute_token_weights(
     """
     Compute final per-token weight for CE loss.
 
-    w_t = α_t · [w_min + (1 − w_min) · (1 − h_t · (1 − q_t))]
+    w_t = w_min + (1 − w_min) · (1 − h_t · (1 − q_t))
 
     Behavior:
-      - Easy token (h≈0):           inner ≈ 1   → w ≈ α_t
-      - Hard + useless (h≈1, q≈0):  inner ≈ w_min → w ≈ α_t · w_min
-      - Hard + useful (h≈1, q≈1):   inner ≈ 1   → w ≈ α_t  (rescued)
+      - Easy token (h≈0):           w ≈ 1
+      - Hard + useless (h≈1, q≈0):  w ≈ w_min  (suppressed)
+      - Hard + useful (h≈1, q≈1):   w ≈ 1      (rescued)
 
     Args:
-        alpha_t: Challenge gate, shape (B, T).
         h_t: Hardness gate, shape (B, T).
         q_t: Useful-hard gate, shape (B, T).
         w_min: Weight floor to prevent zero gradients.
@@ -162,8 +118,7 @@ def compute_token_weights(
     Returns:
         w_t: Final per-token weights, shape (B, T).
     """
-    inner = w_min + (1.0 - w_min) * (1.0 - h_t * (1.0 - q_t))
-    return alpha_t * inner
+    return w_min + (1.0 - w_min) * (1.0 - h_t * (1.0 - q_t))
 
 
 # =====================================================================
@@ -175,10 +130,6 @@ def compute_weighted_ce_loss(
     active_logits: torch.Tensor,
     labels: torch.Tensor,
     prior_target_logp: torch.Tensor,
-    prior_margin: torch.Tensor,
-    lambda1: float = 1.0,
-    lambda2: float = 0.5,
-    tau_c: float = 1.0,
     tau_p: float = 2.0,
     T_p: float = 1.0,
     tau_delta: float = 0.8,
@@ -190,7 +141,7 @@ def compute_weighted_ce_loss(
 
     L = Σ w_t · CE_t / |V|
 
-    w_t = α_t · [w_min + (1 − w_min) · (1 − h_t · (1 − q_t))]
+    w_t = w_min + (1 − w_min) · (1 − h_t · (1 − q_t))
 
     All shifting for next-token prediction is handled internally.
 
@@ -198,10 +149,6 @@ def compute_weighted_ce_loss(
         active_logits: Logits from active model, shape (B, T, V).
         labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
         prior_target_logp: Cached log p₀(y_t), shape (B, T).
-        prior_margin: Cached log p₀(top1) − log p₀(y_t), shape (B, T).
-        lambda1: Weight for prior surprisal in challenge score.
-        lambda2: Weight for margin in challenge score.
-        tau_c: Temperature for challenge gate.
         tau_p: Hardness threshold.
         T_p: Hardness temperature.
         tau_delta: Improvement evidence threshold.
@@ -209,13 +156,12 @@ def compute_weighted_ce_loss(
         w_min: Weight floor.
 
     Returns:
-        Tuple of (scalar loss, dict of intermediate tensors for logging/EMA update).
+        Tuple of (scalar loss, dict of intermediate tensors for logging).
     """
     # Shift for next-token prediction
     shift_logits = active_logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     shift_prior_logp = prior_target_logp[..., 1:].contiguous()
-    shift_prior_margin = prior_margin[..., 1:].contiguous()
 
     shift_mask = shift_labels != -100
     shift_safe_labels = shift_labels.clamp(min=0)
@@ -230,16 +176,10 @@ def compute_weighted_ce_loss(
     # Mask invalid positions
     active_target_logp = per_token_logp * shift_mask.float()
 
-    # --- Gate 1: Challenge α_t ---
-    alpha_t = compute_challenge_gate(
-        shift_prior_logp, shift_prior_margin, shift_mask,
-        lambda1, lambda2, tau_c,
-    )
-
-    # --- Gate 2: Hardness h_t ---
+    # --- Gate 1: Hardness h_t ---
     h_t = compute_hardness_gate(ce_t, shift_mask, tau_p, T_p)
 
-    # --- Gate 3: Useful-hard q_t ---
+    # --- Gate 2: Useful-hard q_t ---
     # Directional improvement: Δ_t⁺ = max(0, log p_θ − log p₀)
     instant_delta_plus = (active_target_logp - shift_prior_logp).clamp(min=0.0)
     instant_delta_plus = instant_delta_plus * shift_mask.float()
@@ -247,19 +187,18 @@ def compute_weighted_ce_loss(
     q_t = compute_useful_hard_gate(instant_delta_plus, shift_mask, tau_delta, T_delta)
 
     # --- Final weight ---
-    w_t = compute_token_weights(alpha_t, h_t, q_t, w_min)
+    w_t = compute_token_weights(h_t, q_t, w_min)
 
     # --- Weighted CE loss ---
     weighted_ce = w_t * ce_t * shift_mask.float()
     num_valid = shift_mask.float().sum().clamp(min=1.0)
     loss = weighted_ce.sum() / num_valid
 
-    # Return intermediates for logging and optional EMA update
+    # Return intermediates for logging
     intermediates = {
         "active_target_logp": active_target_logp,  # (B, T-1), shifted
         "instant_delta_plus": instant_delta_plus,   # (B, T-1), shifted
         "shift_mask": shift_mask,                   # (B, T-1)
-        "alpha_t": alpha_t,                         # (B, T-1)
         "h_t": h_t,                                 # (B, T-1)
         "q_t": q_t,                                 # (B, T-1)
         "w_t": w_t,                                 # (B, T-1)

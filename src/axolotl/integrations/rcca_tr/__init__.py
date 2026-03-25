@@ -17,8 +17,8 @@ Plugin init for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
 
 Provides token-wise adaptive weighted CE fine-tuning with:
   - Offline prior cache (no live frozen model)
-  - Hardness gate h_t (suppress high-perplexity tokens)
-  - Useful-hard gate q_t (rescue tokens with positive improvement evidence)
+  - Hardness gate h_t (suppress high-perplexity tokens by default)
+  - Useful-hard gate q_t (rescue hard tokens with positive improvement evidence)
   - Only the active model in GPU memory
 """
 
@@ -57,9 +57,6 @@ class RCCATRPlugin(BasePlugin):
 
     def get_training_args(self, cfg):
         return {
-            "rcca_tr_conflict_lambda1": cfg.rcca_tr_conflict_lambda1,
-            "rcca_tr_conflict_lambda2": cfg.rcca_tr_conflict_lambda2,
-            "rcca_tr_conflict_tau": cfg.rcca_tr_conflict_tau,
             "rcca_tr_tau_p": cfg.rcca_tr_tau_p,
             "rcca_tr_T_p": cfg.rcca_tr_T_p,
             "rcca_tr_tau_delta": cfg.rcca_tr_tau_delta,

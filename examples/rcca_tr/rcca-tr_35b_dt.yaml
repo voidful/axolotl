@@ -9,9 +9,6 @@ liger_rms_norm: true
 liger_glu_activation: true
 
 rcca_tr_trainer: true
-rcca_tr_conflict_lambda1: 1.0
-rcca_tr_conflict_lambda2: 0.5
-rcca_tr_conflict_tau: 1.0
 rcca_tr_tau_p: 2.0
 rcca_tr_T_p: 1.0
 rcca_tr_tau_delta: 0.8

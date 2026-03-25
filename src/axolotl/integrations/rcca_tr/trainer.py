@@ -18,12 +18,11 @@ RCCA-TR Trainer: Suppress-by-Default, Rescue-if-Useful.
 Only one model lives in GPU memory — the active model being trained.
 The frozen prior is replaced by cached log-probabilities loaded from disk.
 
-Three orthogonal gates per token:
-  A. Challenge gate α_t — does this token challenge the frozen prior?
-  B. Hardness gate h_t  — is this token hard enough to warrant suppression?
-  C. Useful-hard gate q_t — does this hard token improve over the prior?
+Two orthogonal gates per token:
+  A. Hardness gate h_t  — is this token hard enough to warrant suppression?
+  B. Useful-hard gate q_t — does this hard token improve over the prior?
 
-Final weight: w_t = α_t · [w_min + (1-w_min) · (1 - h_t·(1-q_t))]
+Final weight: w_t = w_min + (1-w_min) · (1 - h_t·(1-q_t))
 Loss: L = Σ w_t · CE_t / |V|
 """
 
@@ -44,7 +43,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
     Memory footprint: only the active model (1× model size).
     Prior information comes from cached values in the batch.
-    Optionally smooths Δ_t⁺ with a lightweight EMA buffer.
     """
 
     def __init__(self, *args, **kwargs):
@@ -54,7 +52,7 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
         if self._signature_columns:
-            for col in ["prior_target_logp", "prior_margin"]:
+            for col in ["prior_target_logp"]:
                 if col not in self._signature_columns:
                     self._signature_columns.append(col)
 
@@ -82,7 +80,7 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         # Pop RCCA-TR fields before model forward (model doesn't accept them)
         prior_target_logp = inputs.pop("prior_target_logp", None)
-        prior_margin = inputs.pop("prior_margin", None)
+        inputs.pop("prior_margin", None)  # not used but may be in batch
 
         # Forward pass through active model
         outputs = model(**inputs)
@@ -102,13 +100,12 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         B, T = labels.shape
 
         # Fallback: zeros if prior values not in batch
-        if prior_target_logp is None or prior_margin is None:
+        if prior_target_logp is None:
             LOG.warning(
                 "Prior cache values missing from batch. "
                 "Falling back to zero tensors — RCCA-TR will degrade to standard CE."
             )
             prior_target_logp = torch.zeros(B, T, device=labels.device)
-            prior_margin = torch.zeros(B, T, device=labels.device)
 
         # Compute unified weighted CE loss
         # All shifting is handled inside compute_weighted_ce_loss
@@ -116,10 +113,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             active_logits=active_logits,
             labels=labels,
             prior_target_logp=prior_target_logp,
-            prior_margin=prior_margin,
-            lambda1=getattr(self.args, "rcca_tr_conflict_lambda1", 1.0) or 1.0,
-            lambda2=getattr(self.args, "rcca_tr_conflict_lambda2", 0.5) or 0.5,
-            tau_c=getattr(self.args, "rcca_tr_conflict_tau", 1.0) or 1.0,
             tau_p=getattr(self.args, "rcca_tr_tau_p", 2.0) or 2.0,
             T_p=getattr(self.args, "rcca_tr_T_p", 1.0) or 1.0,
             tau_delta=getattr(self.args, "rcca_tr_tau_delta", 0.8) or 0.8,

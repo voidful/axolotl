@@ -28,17 +28,6 @@ class RCCATRArgs(BaseModel):
 
     rcca_tr_trainer: bool | None = None  # whether to use RCCA-TR trainer
 
-    # --- Challenge gate (α_t) ---
-    rcca_tr_conflict_lambda1: float | None = (
-        1.0  # weight for prior surprisal component
-    )
-    rcca_tr_conflict_lambda2: float | None = (
-        0.5  # weight for margin-based conflict component
-    )
-    rcca_tr_conflict_tau: float | None = (
-        1.0  # temperature for challenge gate sigmoid
-    )
-
     # --- Hardness gate (h_t) ---
     rcca_tr_tau_p: float | None = (
         2.0  # hardness threshold: CE level above which suppression kicks in
@@ -72,9 +61,6 @@ class RCCATRTrainingArgsMixin:
     Additional training args for RCCA-TR.
     """
 
-    rcca_tr_conflict_lambda1: float | None = 1.0
-    rcca_tr_conflict_lambda2: float | None = 0.5
-    rcca_tr_conflict_tau: float | None = 1.0
     rcca_tr_tau_p: float | None = 2.0
     rcca_tr_T_p: float | None = 1.0
     rcca_tr_tau_delta: float | None = 0.8
