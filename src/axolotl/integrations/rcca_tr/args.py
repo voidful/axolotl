@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Plugin args for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
+Plugin args for RCCA-TR (no-cache variant).
 """
 
 from dataclasses import dataclass
@@ -23,31 +23,45 @@ from pydantic import BaseModel
 
 class RCCATRArgs(BaseModel):
     """
-    Input args for RCCA-TR fine-tuning.
+    Input args for RCCA-TR fine-tuning (no-cache variant).
     """
 
     rcca_tr_trainer: bool | None = None  # whether to use RCCA-TR trainer
 
-    # --- Hardness gate (h_t) ---
-    rcca_tr_tau_p: float | None = (
-        2.0  # hardness threshold: CE level above which suppression kicks in
+    # --- Reliability score hyperparameters ---
+    rcca_tr_reliability_beta: float | None = (
+        0.5  # balance between stability and evidence reliability
     )
-    rcca_tr_T_p: float | None = (
-        1.0  # hardness sigmoid temperature
+    rcca_tr_reliability_tau: float | None = (
+        1.0  # temperature for sigmoid mapping of reliability score
     )
 
-    # --- Weight ---
-    rcca_tr_w_min: float | None = (
-        0.05  # weight floor for hard tokens to prevent zero gradients
+    # --- Trust-region hyperparameters ---
+    rcca_tr_epsilon_min: float | None = 0.01  # minimum trust-region radius
+    rcca_tr_epsilon_max: float | None = 1.0  # maximum trust-region radius
+    rcca_tr_kl_lambda: float | None = 1.0  # Lagrange multiplier for KL penalty
+    rcca_tr_use_smooth_objective: bool | None = (
+        True  # use smooth g(r_t)*KL vs hinge max(0, KL - epsilon_t)
+    )
+
+    # --- Drift buffer (replaces EMA model) ---
+    rcca_tr_ema_decay: float | None = 0.999  # decay rate for drift buffer
+    rcca_tr_drift_gamma: float | None = (
+        1.0  # scaling factor for drift → reliability mapping
     )
 
 
 @dataclass
 class RCCATRTrainingArgsMixin:
     """
-    Additional training args for RCCA-TR.
+    Additional training args for RCCA-TR (no-cache variant).
     """
 
-    rcca_tr_tau_p: float | None = 2.0
-    rcca_tr_T_p: float | None = 1.0
-    rcca_tr_w_min: float | None = 0.05
+    rcca_tr_reliability_beta: float | None = 0.5
+    rcca_tr_reliability_tau: float | None = 1.0
+    rcca_tr_epsilon_min: float | None = 0.01
+    rcca_tr_epsilon_max: float | None = 1.0
+    rcca_tr_kl_lambda: float | None = 1.0
+    rcca_tr_use_smooth_objective: bool | None = True
+    rcca_tr_ema_decay: float | None = 0.999
+    rcca_tr_drift_gamma: float | None = 1.0

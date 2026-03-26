@@ -13,20 +13,15 @@
 # limitations under the License.
 
 """
-Plugin init for RCCA-TR: Suppress-by-Default, Rescue-if-Useful.
+Plugin init for RCCA-TR (no-cache variant).
 
-Provides token-wise adaptive weighted CE fine-tuning with:
-  - Offline prior cache (no live frozen model)
-  - Hardness gate h_t (suppress high-perplexity tokens by default)
-  - Useful-hard gate q_t (rescue hard tokens with positive improvement evidence)
+Provides token-wise adaptive trust-region fine-tuning with:
+  - Drift buffer for temporal evidence tracking
   - Only the active model in GPU memory
+  - No frozen prior cache required
 """
 
-import torch
-from transformers import Trainer
-
 from axolotl.integrations.base import BasePlugin
-from axolotl.utils.dict import DictDefault
 from axolotl.utils.logging import get_logger
 
 from .args import RCCATRArgs as RCCATRArgs
@@ -36,10 +31,10 @@ LOG = get_logger(__name__)
 
 class RCCATRPlugin(BasePlugin):
     """
-    Plugin for RCCA-TR support in Axolotl.
+    Plugin for RCCA-TR support in Axolotl (no-cache variant).
 
     Memory: ~1× model size (just the active model).
-    Prior information is pre-computed offline and loaded as cached values.
+    Evidence drift is tracked via a lightweight statistical buffer.
     """
 
     def get_input_args(self):
@@ -57,14 +52,12 @@ class RCCATRPlugin(BasePlugin):
 
     def get_training_args(self, cfg):
         return {
-            "rcca_tr_tau_p": cfg.rcca_tr_tau_p,
-            "rcca_tr_T_p": cfg.rcca_tr_T_p,
-            "rcca_tr_w_min": cfg.rcca_tr_w_min,
+            "rcca_tr_reliability_beta": cfg.rcca_tr_reliability_beta,
+            "rcca_tr_reliability_tau": cfg.rcca_tr_reliability_tau,
+            "rcca_tr_epsilon_min": cfg.rcca_tr_epsilon_min,
+            "rcca_tr_epsilon_max": cfg.rcca_tr_epsilon_max,
+            "rcca_tr_kl_lambda": cfg.rcca_tr_kl_lambda,
+            "rcca_tr_use_smooth_objective": cfg.rcca_tr_use_smooth_objective,
+            "rcca_tr_ema_decay": cfg.rcca_tr_ema_decay,
+            "rcca_tr_drift_gamma": cfg.rcca_tr_drift_gamma,
         }
-
-    def get_collator_cls_and_kwargs(self, cfg, is_eval=False):
-        return None
-
-    def post_trainer_create(self, cfg: DictDefault, trainer: Trainer):
-        pass
-

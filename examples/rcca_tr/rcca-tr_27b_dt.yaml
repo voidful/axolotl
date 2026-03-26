@@ -9,9 +9,14 @@ liger_rms_norm: true
 liger_glu_activation: true
 
 rcca_tr_trainer: true
-rcca_tr_tau_p: 2.0
-rcca_tr_T_p: 1.0
-rcca_tr_w_min: 0.05
+rcca_tr_reliability_beta: 0.5
+rcca_tr_reliability_tau: 1.0
+rcca_tr_epsilon_min: 0.01
+rcca_tr_epsilon_max: 1.0
+rcca_tr_kl_lambda: 1.0
+rcca_tr_use_smooth_objective: true
+rcca_tr_ema_decay: 0.999
+rcca_tr_drift_gamma: 1.0
 
 datasets:
   - path: voidful/gemini-3.1-opus-4.6-reasoning-merged_v2
