@@ -36,22 +36,9 @@ class RCCATRArgs(BaseModel):
         1.0  # hardness sigmoid temperature
     )
 
-    # --- Useful-hard gate (q_t) ---
-    rcca_tr_tau_delta: float | None = (
-        0.8  # improvement threshold for Δ_t⁺
-    )
-    rcca_tr_T_delta: float | None = (
-        1.0  # improvement sigmoid temperature
-    )
-
     # --- Weight ---
     rcca_tr_w_min: float | None = (
-        0.05  # weight floor to prevent zero gradients
-    )
-
-    # --- Prior cache ---
-    rcca_tr_prior_cache_path: str | None = (
-        None  # path to pre-computed prior cache (.pt file)
+        0.05  # weight floor for hard tokens to prevent zero gradients
     )
 
 
@@ -63,7 +50,4 @@ class RCCATRTrainingArgsMixin:
 
     rcca_tr_tau_p: float | None = 2.0
     rcca_tr_T_p: float | None = 1.0
-    rcca_tr_tau_delta: float | None = 0.8
-    rcca_tr_T_delta: float | None = 1.0
     rcca_tr_w_min: float | None = 0.05
-    rcca_tr_prior_cache_path: str | None = None

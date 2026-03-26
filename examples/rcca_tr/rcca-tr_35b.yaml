@@ -11,10 +11,7 @@ liger_glu_activation: true
 rcca_tr_trainer: true
 rcca_tr_tau_p: 2.0
 rcca_tr_T_p: 1.0
-rcca_tr_tau_delta: 0.8
-rcca_tr_T_delta: 1.0
 rcca_tr_w_min: 0.05
-rcca_tr_prior_cache_path: ./prior_cache/prior_cache_35b.pt
 
 datasets:
   - path: voidful/earica_text_train_v2

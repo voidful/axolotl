@@ -59,10 +59,7 @@ class RCCATRPlugin(BasePlugin):
         return {
             "rcca_tr_tau_p": cfg.rcca_tr_tau_p,
             "rcca_tr_T_p": cfg.rcca_tr_T_p,
-            "rcca_tr_tau_delta": cfg.rcca_tr_tau_delta,
-            "rcca_tr_T_delta": cfg.rcca_tr_T_delta,
             "rcca_tr_w_min": cfg.rcca_tr_w_min,
-            "rcca_tr_prior_cache_path": cfg.rcca_tr_prior_cache_path,
         }
 
     def get_collator_cls_and_kwargs(self, cfg, is_eval=False):
