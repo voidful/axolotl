@@ -63,7 +63,7 @@ class RCCATRPlugin(BasePlugin):
         }
 
     def get_collator_cls_and_kwargs(self, cfg, is_eval=False):
-        return None, None
+        return None
 
     def post_trainer_create(self, cfg: DictDefault, trainer: Trainer):
         pass
