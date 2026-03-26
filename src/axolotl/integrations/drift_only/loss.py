@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Core loss functions for RCCA-TR (no-cache variant).
+Core loss functions for Drift-Only variant.
 
 Uses the active model's CE as the drift signal.
 No frozen prior cache is needed.

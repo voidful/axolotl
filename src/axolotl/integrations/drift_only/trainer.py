@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-RCCA-TR Trainer (no-cache variant).
+Drift-Only Trainer.
 
 Only one model lives in GPU memory — the active model being trained.
 Evidence drift is tracked via a lightweight drift buffer using the
@@ -40,9 +40,9 @@ from .loss import (
 LOG = get_logger(__name__)
 
 
-class AxolotlRCCATRTrainer(AxolotlTrainer):
+class AxolotlDriftOnlyTrainer(AxolotlTrainer):
     """
-    RCCA-TR Trust-Region Trainer (no-cache variant).
+    Drift-Only Trust-Region Trainer.
 
     Memory footprint: only the active model (1× model size).
     Evidence drift is tracked via a lightweight DriftBuffer using
@@ -52,15 +52,15 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        LOG.info("Initializing RCCA-TR trainer...")
+        LOG.info("Initializing Drift-Only trainer...")
 
         # Initialize drift buffer
-        ema_decay = getattr(self.args, "rcca_tr_ema_decay", 0.999) or 0.999
-        drift_gamma = getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0
+        ema_decay = getattr(self.args, "drift_only_ema_decay", 0.999) or 0.999
+        drift_gamma = getattr(self.args, "drift_only_gamma", 1.0) or 1.0
         self.drift_buffer = DriftBuffer(decay=ema_decay, gamma=drift_gamma)
 
         LOG.info(
-            "RCCA-TR trainer initialized (drift_decay=%.4f, drift_gamma=%.2f)",
+            "Drift-Only trainer initialized (drift_decay=%.4f, drift_gamma=%.2f)",
             ema_decay,
             drift_gamma,
         )
@@ -74,7 +74,7 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         num_items_in_batch=None,
     ):
         """
-        Compute the RCCA-TR trust-region loss.
+        Compute the Drift-Only trust-region loss.
 
         During training: uses drift buffer + KL proxy.
         During eval: falls back to standard CE loss for proper eval_loss metric.
@@ -109,7 +109,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         valid_mask = labels != -100
 
         # 1. Compute drift-based reliability
-        # Get active model's log p(y_t) for drift estimation
         with torch.no_grad():
             active_log_probs = F.log_softmax(active_logits, dim=-1)
             safe_labels = labels.clamp(min=0)
@@ -125,8 +124,8 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         r_t = compute_reliability_from_drift(
             drift=drift,
-            gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
-            tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
+            gamma=getattr(self.args, "drift_only_gamma", 1.0) or 1.0,
+            tau=getattr(self.args, "drift_only_reliability_tau", 1.0) or 1.0,
         )
 
         # 2. Compute trust-region loss
@@ -134,10 +133,10 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             active_logits=active_logits,
             labels=labels,
             r_t=r_t,
-            kl_lambda=getattr(self.args, "rcca_tr_kl_lambda", 1.0) or 1.0,
-            epsilon_min=getattr(self.args, "rcca_tr_epsilon_min", 0.01) or 0.01,
-            epsilon_max=getattr(self.args, "rcca_tr_epsilon_max", 1.0) or 1.0,
-            use_smooth=getattr(self.args, "rcca_tr_use_smooth_objective", True),
+            kl_lambda=getattr(self.args, "drift_only_kl_lambda", 1.0) or 1.0,
+            epsilon_min=getattr(self.args, "drift_only_epsilon_min", 0.01) or 0.01,
+            epsilon_max=getattr(self.args, "drift_only_epsilon_max", 1.0) or 1.0,
+            use_smooth=getattr(self.args, "drift_only_use_smooth_objective", True),
             num_items_in_batch=num_items_in_batch,
         )
 
@@ -159,13 +158,7 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
     ):
         """
         Override prediction_step to use standard CE loss during eval.
-
-        The default Trainer.prediction_step calls compute_loss, but under
-        DeepSpeed ZeRO-2, model.training may still be True during eval.
-        This override explicitly puts the model in eval mode and computes
-        CE loss directly, ensuring eval_loss is always populated.
         """
-        # Filter inputs to only what the model accepts
         model_inputs = {
             k: v for k, v in inputs.items()
             if k in ("input_ids", "attention_mask", "position_ids", "labels")
@@ -183,7 +176,6 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         if prediction_loss_only:
             return (loss.detach(), None, None)
 
-        # Return loss + logits + labels for metric computation
         logits = outputs.logits if hasattr(outputs, "logits") else None
         labels = inputs.get("labels", None)
         return (

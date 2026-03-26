@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Drift buffer for RCCA-TR.
+Drift buffer for Drift-Only variant.
 
 Tracks how much the active model's predictions diverge from baseline (zeros)
 over time, providing a temporal evidence signal without storing a full model copy.

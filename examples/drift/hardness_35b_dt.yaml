@@ -2,28 +2,23 @@ base_model: voidful/Qwen3.5-35B-A3B-earica
 low_cpu_mem_usage: true
 
 plugins:
-  - axolotl.integrations.rcca_tr.RCCATRPlugin
+  - axolotl.integrations.hardness.HardnessPlugin
   - axolotl.integrations.liger.LigerPlugin
 
 liger_rms_norm: true
 liger_glu_activation: true
 
-rcca_tr_trainer: true
-rcca_tr_reliability_beta: 0.5
-rcca_tr_reliability_tau: 1.0
-rcca_tr_epsilon_min: 0.01
-rcca_tr_epsilon_max: 1.0
-rcca_tr_kl_lambda: 1.0
-rcca_tr_use_smooth_objective: true
-rcca_tr_ema_decay: 0.999
-rcca_tr_drift_gamma: 1.0
+hardness_trainer: true
+hardness_tau_p: 2.0
+hardness_T_p: 1.0
+hardness_w_min: 0.05
 
 datasets:
   - path: voidful/gemini-3.1-opus-4.6-reasoning-merged_v2
     type: chat_template
     split: train
 
-dataset_prepared_path: ./prepared_data/rcca_tr_35b
+dataset_prepared_path: ./prepared_data/hardness_35b_dt
 
 chat_template: qwen3_5
 
@@ -46,11 +41,11 @@ flash_attention: true
 dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
-output_dir: ./outputs/rcca-tr-35b-dt
+output_dir: ./outputs/hardness-35b-dt
 
 deepspeed: deepspeed_configs/zero2.json
 
-hub_model_id: voidful/Qwen3.5-35B-A3B-gemini-3.1-opus-4.6-reasoning
+hub_model_id: voidful/Qwen3.5-35B-A3B-gemini-3.1-opus-4.6-reasoning-hardness
 push_to_hub: true
 hub_strategy: end
 

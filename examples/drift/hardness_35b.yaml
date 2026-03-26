@@ -1,0 +1,55 @@
+base_model: Qwen/Qwen3.5-35B-A3B
+low_cpu_mem_usage: true
+
+plugins:
+  - axolotl.integrations.hardness.HardnessPlugin
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+hardness_trainer: true
+hardness_tau_p: 2.0
+hardness_T_p: 1.0
+hardness_w_min: 0.05
+
+datasets:
+  - path: voidful/earica_text_train_v2
+    type: chat_template
+    field_messages: conversations
+    split: train
+    split_thinking: true
+
+dataset_prepared_path: ./prepared_data/hardness_35b
+
+chat_template: qwen3_5
+
+sequence_len: 8192
+sample_packing: true
+pad_to_sequence_len: false
+
+gradient_accumulation_steps: 2
+micro_batch_size: 1
+batch_flattening: false
+group_by_length: true
+num_epochs: 3
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2e-5
+
+bf16: true
+gradient_checkpointing: true
+flash_attention: true
+dataloader_num_workers: 4
+val_set_size: 0.05
+save_strategy: epoch
+output_dir: ./outputs/hardness-35b
+
+deepspeed: deepspeed_configs/zero2.json
+
+hub_model_id: voidful/Qwen3.5-35B-A3B-earica-hardness
+push_to_hub: true
+hub_strategy: end
+
+log_on_each_node: false
+logging_steps: 1
