@@ -13,15 +13,15 @@
 # limitations under the License.
 
 """
-Drift Trainer: Unified Risk Score.
+Drift Trainer.
 
-Single model, single forward pass per step.
-Token risk is computed from instantaneous hardness (CE) and historical
-drift (EMA of CE), then mapped to reliability for weighted loss.
+Only one model lives in GPU memory — the active model being trained.
+Evidence drift is tracked via a lightweight drift buffer using the
+active model's own CE as the drift signal.
 
-  z_t = β · zn(CE_t) + (1-β) · zn(d_t)
-  r_t = σ(-z_t / τ)
-  L   = λ · r_t · CE_t / |V|
+On each step, it computes:
+  - Drift-based reliability r_t
+  - Trust-region loss: λ · r_t · CE
 """
 
 import torch
@@ -31,31 +31,38 @@ from typing_extensions import override
 from axolotl.core.trainers.base import AxolotlTrainer
 from axolotl.utils.logging import get_logger
 
-from .drift import DriftTracker
-from .loss import compute_risk_weighted_loss, compute_unified_risk
+from .drift import DriftBuffer
+from .loss import (
+    compute_reliability_from_drift,
+    compute_trust_region_loss,
+)
 
 LOG = get_logger(__name__)
 
 
 class AxolotlDriftTrainer(AxolotlTrainer):
     """
-    Drift Trainer with unified risk scoring.
+    Drift Trust-Region Trainer.
 
-    Memory: 1× model size. No teacher, no cache, no second forward.
+    Memory footprint: only the active model (1× model size).
+    Evidence drift is tracked via a lightweight DriftBuffer using
+    the active model's CE as the sole drift signal.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        rho = getattr(self.args, "drift_rho", 0.999) or 0.999
-        self.drift_tracker = DriftTracker(rho=rho)
+        LOG.info("Initializing Drift trainer...")
+
+        # Initialize drift buffer
+        ema_decay = getattr(self.args, "drift_ema_decay", 0.999) or 0.999
+        drift_gamma = getattr(self.args, "drift_gamma", 1.0) or 1.0
+        self.drift_buffer = DriftBuffer(decay=ema_decay, gamma=drift_gamma)
 
         LOG.info(
-            "Drift trainer initialized (ρ=%.4f, β=%.2f, τ=%.2f, λ=%.2f)",
-            rho,
-            getattr(self.args, "drift_beta", 0.5) or 0.5,
-            getattr(self.args, "drift_tau", 1.0) or 1.0,
-            getattr(self.args, "drift_lambda", 1.0) or 1.0,
+            "Drift trainer initialized (drift_decay=%.4f, drift_gamma=%.2f)",
+            ema_decay,
+            drift_gamma,
         )
 
     @override
@@ -67,13 +74,10 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         num_items_in_batch=None,
     ):
         """
-        Single-forward unified risk score loss.
+        Compute the Drift trust-region loss.
 
-        1. Forward → logits → per-token CE
-        2. Drift tracker → per-token d_t
-        3. Unified risk z_t → reliability r_t
-        4. Loss = λ · r_t · CE_t
-        5. Update drift tracker
+        During training: uses drift buffer + KL proxy.
+        During eval: falls back to standard CE loss for proper eval_loss metric.
         """
         # Handle sample packing
         if (
@@ -86,15 +90,16 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         if num_items_in_batch is None and "labels" in inputs:
             num_items_in_batch = (inputs["labels"] != -100).sum().item()
 
-        # Single forward pass
+        # Forward pass through active model
         outputs = model(**inputs)
 
-        # Eval: standard CE
+        # During eval, use standard CE loss (trust-region doesn't apply)
         if not model.training:
             loss = outputs.loss if outputs.loss is not None else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
         active_logits = outputs.logits  # (B, T, V)
+
         labels = inputs.get("labels", None)
         if labels is None:
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
@@ -103,40 +108,43 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         B, T = labels.shape
         valid_mask = labels != -100
 
-        # --- Compute per-token CE (unshifted, for risk computation) ---
+        # 1. Compute drift-based reliability
         with torch.no_grad():
-            log_probs = F.log_softmax(active_logits, dim=-1)
+            active_log_probs = F.log_softmax(active_logits, dim=-1)
             safe_labels = labels.clamp(min=0)
-            token_logp = log_probs.gather(
+            active_target_logp = active_log_probs.gather(
                 dim=-1, index=safe_labels.unsqueeze(-1)
             ).squeeze(-1)  # (B, T)
-            ce_t = -token_logp * valid_mask.float()  # (B, T)
+            active_target_logp = active_target_logp * valid_mask.float()
 
-        # --- Get drift d_t ---
-        with torch.no_grad():
-            d_t = self.drift_tracker.get_drift(ce_t, valid_mask)
+        drift = self.drift_buffer.get_current_drift(
+            active_target_logp=active_target_logp,
+            valid_mask=valid_mask,
+        )
 
-        # --- Compute unified risk → reliability ---
-        with torch.no_grad():
-            r_t = compute_unified_risk(
-                ce_t=ce_t,
-                d_t=d_t,
-                valid_mask=valid_mask,
-                beta=getattr(self.args, "drift_beta", 0.5) or 0.5,
-                tau=getattr(self.args, "drift_tau", 1.0) or 1.0,
-            )
+        r_t = compute_reliability_from_drift(
+            drift=drift,
+            gamma=getattr(self.args, "drift_gamma", 1.0) or 1.0,
+            tau=getattr(self.args, "drift_reliability_tau", 1.0) or 1.0,
+        )
 
-        # --- Compute loss (with gradient) ---
-        loss, per_token_ce_shifted = compute_risk_weighted_loss(
+        # 2. Compute trust-region loss
+        loss, _ = compute_trust_region_loss(
             active_logits=active_logits,
             labels=labels,
             r_t=r_t,
-            lam=getattr(self.args, "drift_lambda", 1.0) or 1.0,
+            kl_lambda=getattr(self.args, "drift_kl_lambda", 1.0) or 1.0,
+            epsilon_min=getattr(self.args, "drift_epsilon_min", 0.01) or 0.01,
+            epsilon_max=getattr(self.args, "drift_epsilon_max", 1.0) or 1.0,
+            use_smooth=getattr(self.args, "drift_use_smooth_objective", True),
             num_items_in_batch=num_items_in_batch,
         )
 
-        # --- Update drift tracker ---
-        self.drift_tracker.step(ce_t, valid_mask)
+        # 3. Update drift buffer with this step's values
+        self.drift_buffer.step(
+            active_target_logp=active_target_logp,
+            valid_mask=valid_mask,
+        )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -148,7 +156,9 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         prediction_loss_only,
         ignore_keys=None,
     ):
-        """Standard CE for eval."""
+        """
+        Override prediction_step to use standard CE loss during eval.
+        """
         model_inputs = {
             k: v for k, v in inputs.items()
             if k in ("input_ids", "attention_mask", "position_ids", "labels")

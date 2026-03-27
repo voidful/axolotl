@@ -13,10 +13,7 @@
 # limitations under the License.
 
 """
-Plugin args for Drift: Unified Risk Score.
-
-Combines instantaneous hardness (CE_t) and historical drift (d_t)
-into a single token risk score z_t, then maps to reliability r_t.
+Plugin args for Drift variant.
 """
 
 from dataclasses import dataclass
@@ -26,37 +23,41 @@ from pydantic import BaseModel
 
 class DriftArgs(BaseModel):
     """
-    Input args for Drift fine-tuning (unified risk score).
+    Input args for Drift fine-tuning.
     """
 
     drift_trainer: bool | None = None
 
-    # --- EMA drift ---
-    drift_rho: float | None = (
-        0.999  # EMA decay for drift: d_t = ρ·d_{t-1} + (1-ρ)·CE_t
+    # --- Reliability score hyperparameters ---
+    drift_reliability_beta: float | None = (
+        0.5  # balance between stability and evidence reliability
+    )
+    drift_reliability_tau: float | None = (
+        1.0  # temperature for sigmoid mapping of reliability score
     )
 
-    # --- Unified risk score ---
-    drift_beta: float | None = (
-        0.5  # balance: β·z_CE + (1-β)·z_drift (0=all drift, 1=all hardness)
-    )
-    drift_tau: float | None = (
-        1.0  # temperature for reliability sigmoid: r_t = σ(-z_t/τ)
-    )
+    # --- Trust-region hyperparameters ---
+    drift_epsilon_min: float | None = 0.01
+    drift_epsilon_max: float | None = 1.0
+    drift_kl_lambda: float | None = 1.0
+    drift_use_smooth_objective: bool | None = True
 
-    # --- Loss ---
-    drift_lambda: float | None = (
-        1.0  # overall loss multiplier: L = λ·r_t·CE_t
-    )
+    # --- Drift buffer ---
+    drift_ema_decay: float | None = 0.999
+    drift_gamma: float | None = 1.0
 
 
 @dataclass
 class DriftTrainingArgsMixin:
     """
-    Additional training args for Drift (unified risk score).
+    Additional training args for Drift.
     """
 
-    drift_rho: float | None = 0.999
-    drift_beta: float | None = 0.5
-    drift_tau: float | None = 1.0
-    drift_lambda: float | None = 1.0
+    drift_reliability_beta: float | None = 0.5
+    drift_reliability_tau: float | None = 1.0
+    drift_epsilon_min: float | None = 0.01
+    drift_epsilon_max: float | None = 1.0
+    drift_kl_lambda: float | None = 1.0
+    drift_use_smooth_objective: bool | None = True
+    drift_ema_decay: float | None = 0.999
+    drift_gamma: float | None = 1.0

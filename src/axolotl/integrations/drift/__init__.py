@@ -13,11 +13,16 @@
 # limitations under the License.
 
 """
-Plugin init for Drift: Unified Risk Score.
+Plugin init for Drift variant.
 
-Combines instantaneous hardness and historical drift into a single
-token risk score for adaptive weighted CE fine-tuning.
-Single model, single forward, no cache.
+Drift-based trust-region fine-tuning with:
+  - DriftBuffer for temporal evidence tracking
+  - Only the active model in GPU memory
+  - No frozen prior cache required
+
+  drift_t = 0.5 · CE_t + 0.5 · d_running
+  r_t = σ((exp(-γ · drift_t) - μ) / τ)
+  L = λ · r_t · CE_t
 """
 
 from axolotl.integrations.base import BasePlugin
@@ -30,9 +35,10 @@ LOG = get_logger(__name__)
 
 class DriftPlugin(BasePlugin):
     """
-    Plugin for Drift (unified risk score).
+    Plugin for Drift variant.
 
-    Memory: ~1× model size. No teacher, no cache.
+    Memory: ~1× model size (just the active model).
+    Evidence drift is tracked via a lightweight statistical buffer.
     """
 
     def get_input_args(self):
@@ -50,8 +56,12 @@ class DriftPlugin(BasePlugin):
 
     def get_training_args(self, cfg):
         return {
-            "drift_rho": cfg.drift_rho,
-            "drift_beta": cfg.drift_beta,
-            "drift_tau": cfg.drift_tau,
-            "drift_lambda": cfg.drift_lambda,
+            "drift_reliability_beta": cfg.drift_reliability_beta,
+            "drift_reliability_tau": cfg.drift_reliability_tau,
+            "drift_epsilon_min": cfg.drift_epsilon_min,
+            "drift_epsilon_max": cfg.drift_epsilon_max,
+            "drift_kl_lambda": cfg.drift_kl_lambda,
+            "drift_use_smooth_objective": cfg.drift_use_smooth_objective,
+            "drift_ema_decay": cfg.drift_ema_decay,
+            "drift_gamma": cfg.drift_gamma,
         }

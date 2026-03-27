@@ -9,10 +9,14 @@ liger_rms_norm: true
 liger_glu_activation: true
 
 drift_trainer: true
-drift_rho: 0.999
-drift_beta: 0.5
-drift_tau: 1.0
-drift_lambda: 1.0
+drift_reliability_beta: 0.5
+drift_reliability_tau: 1.0
+drift_epsilon_min: 0.01
+drift_epsilon_max: 1.0
+drift_kl_lambda: 1.0
+drift_use_smooth_objective: true
+drift_ema_decay: 0.999
+drift_gamma: 1.0
 
 datasets:
   - path: voidful/earica_text_train_v2
@@ -45,11 +49,11 @@ flash_attention: true
 dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
-output_dir: ./outputs/drift-27b
+output_dir: ./outputs/drift-drift-27b
 
 deepspeed: deepspeed_configs/zero2.json
 
-hub_model_id: voidful/Qwen3.5-27B-earica
+hub_model_id: voidful/Qwen3.5-27B-earica-drift
 push_to_hub: true
 hub_strategy: end
 

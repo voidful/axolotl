@@ -13,124 +13,124 @@
 # limitations under the License.
 
 """
-Drift: Unified Risk Score Loss.
+Core loss functions for Drift variant.
 
-Combines instantaneous hardness (CE_t) and historical drift (d_t)
-into a single token risk z_t, then maps to reliability r_t.
+Uses the active model's CE as the drift signal.
+No frozen prior cache is needed.
 
-  CE_t = -log p_θ(y_t)                       (instantaneous hardness)
-  d_t  = ρ · d_{t-1} + (1-ρ) · CE_t          (historical drift)
-  z_t  = β · zn(CE_t) + (1-β) · zn(d_t)      (unified risk, zn = z-score)
-  r_t  = σ(-z_t / τ)                          (reliability)
-  L    = (λ / |V|) · Σ r_t · CE_t             (loss)
+Token-level signal:
+  - Reliability score (r_t): drift-based evidence reliability.
+    r_evi = exp(-γ · d_t), then z-score + sigmoid.
 
-Intuition:
-  - CE_t high + d_t high → dangerous token, suppress hard
-  - CE_t high + d_t low  → temporarily hard, being learned, don't suppress
-  - CE_t low  + d_t low  → easy, learn normally (r_t ≈ high)
+Trust-region objective:
+  L_t = λ · r_t · CE_t   (smooth form)
 """
 
 import torch
 import torch.nn.functional as F
 
 
-def compute_unified_risk(
-    ce_t: torch.Tensor,
-    d_t: torch.Tensor,
-    valid_mask: torch.Tensor,
-    beta: float = 0.5,
+def compute_reliability_from_drift(
+    drift: torch.Tensor,
+    gamma: float = 1.0,
     tau: float = 1.0,
-    eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Compute unified risk score and map to reliability.
+    Compute combined reliability from drift buffer.
 
-    z_t = β · (CE_t - μ_CE) / σ_CE + (1-β) · (d_t - μ_d) / σ_d
-    r_t = σ(-z_t / τ)
+    r_evi = exp(-γ · d_t)
+    r_t = σ((r_evi - μ) / τ)
 
     Args:
-        ce_t: Per-token cross-entropy, shape (B, T).
-        d_t: Per-token drift, shape (B, T).
-        valid_mask: Boolean mask, shape (B, T).
-        beta: Balance between hardness (CE) and drift.
-        tau: Temperature for sigmoid.
-        eps: Numerical stability.
+        drift: Per-token drift values, shape (B, T).
+        gamma: Scaling factor for drift → reliability.
+        tau: Temperature for sigmoid normalization.
 
     Returns:
         r_t: Reliability scores in [0, 1], shape (B, T).
     """
-    mask_f = valid_mask.float()
+    r_evi = torch.exp(-gamma * drift)
 
-    # Z-score normalize CE over valid tokens
-    valid_ce = ce_t[valid_mask]
-    mu_ce = valid_ce.mean() if valid_ce.numel() > 0 else ce_t.new_tensor(0.0)
-    sigma_ce = valid_ce.std() if valid_ce.numel() > 1 else ce_t.new_tensor(1.0)
-    sigma_ce = sigma_ce.clamp(min=eps)
-    z_ce = (ce_t - mu_ce) / sigma_ce
+    # Center and normalize
+    mu = r_evi.mean()
+    normalized = (r_evi - mu) / tau
 
-    # Z-score normalize drift over valid tokens
-    valid_d = d_t[valid_mask]
-    mu_d = valid_d.mean() if valid_d.numel() > 0 else d_t.new_tensor(0.0)
-    sigma_d = valid_d.std() if valid_d.numel() > 1 else d_t.new_tensor(1.0)
-    sigma_d = sigma_d.clamp(min=eps)
-    z_d = (d_t - mu_d) / sigma_d
+    r_t = torch.sigmoid(normalized)
 
-    # Unified risk
-    z_t = beta * z_ce + (1.0 - beta) * z_d
-
-    # Map to reliability: high risk → low reliability
-    r_t = torch.sigmoid(-z_t / tau)
-
-    return r_t * mask_f
+    return r_t
 
 
-def compute_risk_weighted_loss(
+def compute_trust_region_loss(
     active_logits: torch.Tensor,
     labels: torch.Tensor,
     r_t: torch.Tensor,
-    lam: float = 1.0,
+    kl_lambda: float = 1.0,
+    epsilon_min: float = 0.01,
+    epsilon_max: float = 1.0,
+    use_smooth: bool = True,
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute risk-weighted CE loss.
+    Compute trust-region loss (no-cache variant).
 
-    L = (λ / |V|) · Σ r_t · CE_t
+    Smooth form:
+        L_t = λ · r_t · KL_proxy_t
+
+    Without cache, KL_proxy = CE_t + 0 = CE_t, so:
+        L_t = λ · r_t · CE_t
 
     Args:
-        active_logits: Model logits, shape (B, T, V).
-        labels: Token IDs, shape (B, T). -100 = ignore.
+        active_logits: Logits from active model, shape (B, T, V).
+        labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
         r_t: Reliability scores, shape (B, T).
-        lam: Overall loss multiplier.
+        kl_lambda: Lagrange multiplier (scales the overall loss).
+        epsilon_min: Min trust-region radius (hinge only).
+        epsilon_max: Max trust-region radius (hinge only).
+        use_smooth: If True, smooth form; otherwise hinge.
         num_items_in_batch: For sample packing normalization.
 
     Returns:
-        Tuple of (scalar loss, per-token CE for drift update).
+        Tuple of (scalar loss, active_target_logp_shifted for drift buffer update).
     """
     # Shift for next-token prediction
     shift_logits = active_logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     shift_safe_labels = shift_labels.clamp(min=0)
     shift_mask = shift_labels != -100
-    # r_t[t] = risk of label[t], so for shifted loss predicting label[t+1],
-    # we need r_t[1:] to match shift_labels = labels[1:]
     shift_r = r_t[..., 1:].contiguous()
 
     vocab_size = shift_logits.size(-1)
 
-    # Per-token CE
+    # Per-token CE loss
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
     per_token_ce = ce_loss_fn(
         shift_logits.view(-1, vocab_size),
         shift_safe_labels.view(-1),
     ).view(shift_labels.shape)  # (B, T-1)
 
-    # Weighted loss: λ · r_t · CE_t
-    weighted = lam * shift_r * per_token_ce * shift_mask.float()
+    # KL proxy: CE_t (since prior_target_logp = 0)
+    kl_proxy = per_token_ce.clamp(min=0.0)  # (B, T-1)
+
+    if use_smooth:
+        # Smooth: λ · r_t · KL_proxy
+        total_per_token = kl_lambda * shift_r * kl_proxy * shift_mask.float()
+    else:
+        # Hinge: λ · max(0, KL_proxy - ε_t)
+        epsilon_t = epsilon_max - shift_r * (epsilon_max - epsilon_min)
+        kl_hinge = torch.clamp(kl_proxy - epsilon_t, min=0.0)
+        total_per_token = kl_lambda * kl_hinge * shift_mask.float()
 
     if num_items_in_batch is not None:
-        loss = weighted.sum() / num_items_in_batch
+        loss = total_per_token.sum() / num_items_in_batch
     else:
         num_valid = shift_mask.float().sum().clamp(min=1.0)
-        loss = weighted.sum() / num_valid
+        loss = total_per_token.sum() / num_valid
 
-    return loss, per_token_ce
+    # Compute active model's log p(y_t) for drift buffer
+    active_log_probs = F.log_softmax(shift_logits.detach(), dim=-1)
+    active_target_logp_shifted = active_log_probs.gather(
+        dim=-1, index=shift_safe_labels.unsqueeze(-1)
+    ).squeeze(-1)  # (B, T-1)
+    active_target_logp_shifted = active_target_logp_shifted * shift_mask.float()
+
+    return loss, active_target_logp_shifted
