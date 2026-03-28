@@ -14,6 +14,7 @@ datasets:
     type: chat_template
     field_messages: conversations
     split: train
+    split_thinking: true
 
 dataset_prepared_path: ./prepared_data/baseline_27b
 

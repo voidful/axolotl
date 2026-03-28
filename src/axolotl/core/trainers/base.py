@@ -344,13 +344,6 @@ class AxolotlTrainer(
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
-        # use one's weighted cross entropy loss calc
-        # if self.args.sample_packing:
-        #     labels = inputs.pop("labels")
-        #     outputs = model(**inputs)
-        #     loss = trainer_weighted_loss(outputs, labels, shift_labels=True)
-        #     return (loss, outputs) if return_outputs else loss
-
         # track number of tokens for tokens per second calculation
         if self.args.include_tkps and model.training:
             inputs_key = "labels" if "labels" in inputs else "input_ids"
@@ -387,6 +380,41 @@ class AxolotlTrainer(
                 return_outputs=return_outputs,
                 num_items_in_batch=num_items_in_batch,
             )
+
+        # When sample_packing is enabled, compute CE loss externally to avoid
+        # the float32 logits upcast in ForCausalLMLoss. For large-vocab models
+        # (e.g. 151K vocab), this saves ~9.5 GB of GPU memory per device.
+        if self.args.sample_packing and "labels" in inputs:
+            # Pop labels so the model forward skips ForCausalLMLoss entirely
+            labels = inputs.pop("labels")
+
+            # Drop attention_mask when position_ids are available (flash attn)
+            if (
+                "attention_mask" in inputs
+                and "position_ids" in inputs
+            ):
+                del inputs["attention_mask"]
+
+            if num_items_in_batch is None:
+                num_items_in_batch = (labels != -100).sum().item()
+
+            outputs = model(**inputs)
+            logits = outputs.logits  # stays in bf16, no float32 copy
+
+            # Shift for next-token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # Compute CE loss in native dtype (bf16) — no upcast
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss / num_items_in_batch
+
+            return (loss, outputs) if return_outputs else loss
 
         return super().compute_loss(
             model,
