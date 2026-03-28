@@ -31,9 +31,19 @@ def get_cu_seqlens(position_ids):
     Qwen3.5 uses MRoPE: position_ids arrive as [axes, B, T]. All axes carry the
     same temporal positions, so axis 0 is used to recover the [B, T] layout.
     See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py
+
+    NOTE: During gradient checkpointing backward, position_ids may reside on a
+    peer GPU (via NVLink). We clone it to the current device to avoid
+    "Invalid access of peer GPU memory over nvlink" CUDA errors.
     """
     if position_ids.ndim == 3:
         position_ids = position_ids[0]
+
+    # Guard against cross-GPU references from gradient checkpointing recompute
+    if position_ids.is_cuda:
+        current_device = torch.cuda.current_device()
+        if position_ids.device.index != current_device:
+            position_ids = position_ids.to(f"cuda:{current_device}")
 
     tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
     position_ids = position_ids.view(-1)
