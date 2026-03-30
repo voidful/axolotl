@@ -17,6 +17,7 @@ drift_kl_lambda: 1.0
 drift_use_smooth_objective: true
 drift_ema_decay: 0.999
 drift_gamma: 1.0
+drift_anchor_weight: 0.5
 
 datasets:
   - path: voidful/gemini-3.1-opus-4.6-reasoning-merged_v2

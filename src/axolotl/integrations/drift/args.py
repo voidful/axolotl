@@ -40,6 +40,7 @@ class DriftArgs(BaseModel):
     drift_epsilon_min: float | None = 0.01
     drift_epsilon_max: float | None = 1.0
     drift_kl_lambda: float | None = 1.0
+    drift_anchor_weight: float | None = 0.5  # baseline CE floor weight
     drift_use_smooth_objective: bool | None = True
 
     # --- Drift buffer ---
@@ -58,6 +59,7 @@ class DriftTrainingArgsMixin:
     drift_epsilon_min: float | None = 0.01
     drift_epsilon_max: float | None = 1.0
     drift_kl_lambda: float | None = 1.0
+    drift_anchor_weight: float | None = 0.5
     drift_use_smooth_objective: bool | None = True
     drift_ema_decay: float | None = 0.999
     drift_gamma: float | None = 1.0

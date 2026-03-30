@@ -134,6 +134,7 @@ class AxolotlDriftTrainer(AxolotlTrainer):
             labels=labels,
             r_t=r_t,
             kl_lambda=getattr(self.args, "drift_kl_lambda", 1.0) or 1.0,
+            anchor_weight=getattr(self.args, "drift_anchor_weight", 0.5) or 0.0,
             epsilon_min=getattr(self.args, "drift_epsilon_min", 0.01) or 0.01,
             epsilon_max=getattr(self.args, "drift_epsilon_max", 1.0) or 1.0,
             use_smooth=getattr(self.args, "drift_use_smooth_objective", True),

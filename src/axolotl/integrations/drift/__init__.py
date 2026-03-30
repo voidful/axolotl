@@ -61,6 +61,7 @@ class DriftPlugin(BasePlugin):
             "drift_epsilon_min": cfg.drift_epsilon_min,
             "drift_epsilon_max": cfg.drift_epsilon_max,
             "drift_kl_lambda": cfg.drift_kl_lambda,
+            "drift_anchor_weight": cfg.drift_anchor_weight,
             "drift_use_smooth_objective": cfg.drift_use_smooth_objective,
             "drift_ema_decay": cfg.drift_ema_decay,
             "drift_gamma": cfg.drift_gamma,

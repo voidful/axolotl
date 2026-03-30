@@ -17,6 +17,7 @@ drift_kl_lambda: 1.0
 drift_use_smooth_objective: true
 drift_ema_decay: 0.999
 drift_gamma: 1.0
+drift_anchor_weight: 0.5
 
 datasets:
   - path: voidful/earica_text_train_v2

@@ -65,25 +65,27 @@ def compute_trust_region_loss(
     labels: torch.Tensor,
     r_t: torch.Tensor,
     kl_lambda: float = 1.0,
+    anchor_weight: float = 0.5,
     epsilon_min: float = 0.01,
     epsilon_max: float = 1.0,
     use_smooth: bool = True,
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute trust-region loss (no-cache variant).
+    Compute trust-region loss with anchor CE floor.
 
-    Smooth form:
-        L_t = λ · r_t · KL_proxy_t
+    Loss = anchor_weight · CE_t + λ · r_t · CE_t
+         = (anchor_weight + λ · r_t) · CE_t
 
-    Without cache, KL_proxy = CE_t + 0 = CE_t, so:
-        L_t = λ · r_t · CE_t
+    The anchor term ensures every token gets at least anchor_weight × CE of
+    learning signal, even when r_t → 0 (high drift / low reliability).
 
     Args:
         active_logits: Logits from active model, shape (B, T, V).
         labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
         r_t: Reliability scores, shape (B, T).
-        kl_lambda: Lagrange multiplier (scales the overall loss).
+        kl_lambda: Lagrange multiplier for drift-modulated term.
+        anchor_weight: Baseline CE weight (0 = pure drift, 0.5 = RCCA-TR style).
         epsilon_min: Min trust-region radius (hinge only).
         epsilon_max: Max trust-region radius (hinge only).
         use_smooth: If True, smooth form; otherwise hinge.
@@ -108,17 +110,23 @@ def compute_trust_region_loss(
         shift_safe_labels.view(-1),
     ).view(shift_labels.shape)  # (B, T-1)
 
-    # KL proxy: CE_t (since prior_target_logp = 0)
+    # Anchor: baseline CE floor
+    anchor_term = anchor_weight * per_token_ce * shift_mask.float()
+
+    # KL proxy: CE_t (since no prior cache)
     kl_proxy = per_token_ce.clamp(min=0.0)  # (B, T-1)
 
     if use_smooth:
         # Smooth: λ · r_t · KL_proxy
-        total_per_token = kl_lambda * shift_r * kl_proxy * shift_mask.float()
+        drift_term = kl_lambda * shift_r * kl_proxy * shift_mask.float()
     else:
         # Hinge: λ · max(0, KL_proxy - ε_t)
         epsilon_t = epsilon_max - shift_r * (epsilon_max - epsilon_min)
         kl_hinge = torch.clamp(kl_proxy - epsilon_t, min=0.0)
-        total_per_token = kl_lambda * kl_hinge * shift_mask.float()
+        drift_term = kl_lambda * kl_hinge * shift_mask.float()
+
+    # Combine: (anchor_weight + λ · r_t) · CE
+    total_per_token = anchor_term + drift_term
 
     if num_items_in_batch is not None:
         loss = total_per_token.sum() / num_items_in_batch
