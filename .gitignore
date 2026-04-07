@@ -209,3 +209,5 @@ examples/rcca_tr/reshard_and_upload.py
 # SLURM scripts
 examples/drift/*.sh
 examples/drift/reshard_and_upload.py
+paper/drift_trust_neurips2026.tex
+paper/ref.bib
