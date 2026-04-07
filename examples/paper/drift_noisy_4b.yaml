@@ -39,8 +39,8 @@ sequence_len: 4096
 sample_packing: true
 pad_to_sequence_len: false
 
-gradient_accumulation_steps: 4
-micro_batch_size: 2
+gradient_accumulation_steps: 8
+micro_batch_size: 1
 num_epochs: 3
 optimizer: adamw_torch_fused
 lr_scheduler: cosine
