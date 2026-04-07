@@ -135,10 +135,12 @@ def compute_trust_region_loss(
         loss = total_per_token.sum() / num_valid
 
     # Compute active model's log p(y_t) for drift buffer
-    active_log_probs = F.log_softmax(shift_logits.detach(), dim=-1)
-    active_target_logp_shifted = active_log_probs.gather(
-        dim=-1, index=shift_safe_labels.unsqueeze(-1)
-    ).squeeze(-1)  # (B, T-1)
-    active_target_logp_shifted = active_target_logp_shifted * shift_mask.float()
+    # Avoid full-vocab log_softmax: use logsumexp + gather (only (B,T) intermediates)
+    with torch.no_grad():
+        target_logit = shift_logits.detach().gather(
+            dim=-1, index=shift_safe_labels.unsqueeze(-1)
+        ).squeeze(-1)  # (B, T-1)
+        lse = torch.logsumexp(shift_logits.detach(), dim=-1)  # (B, T-1)
+        active_target_logp_shifted = (target_logit - lse) * shift_mask.float()
 
     return loss, active_target_logp_shifted
