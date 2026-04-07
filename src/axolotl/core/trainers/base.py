@@ -398,7 +398,14 @@ class AxolotlTrainer(
             if num_items_in_batch is None:
                 num_items_in_batch = (labels != -100).sum().item()
 
-            outputs = model(**inputs)
+            import accelerate.utils.operations as accel_ops
+            original_convert = accel_ops.convert_to_fp32
+            accel_ops.convert_to_fp32 = lambda x: x
+            try:
+                outputs = model(**inputs)
+            finally:
+                accel_ops.convert_to_fp32 = original_convert
+
             logits = outputs.logits  # stays in bf16, no float32 copy
 
             # Shift for next-token prediction
