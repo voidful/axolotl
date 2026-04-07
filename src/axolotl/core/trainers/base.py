@@ -435,6 +435,18 @@ class AxolotlTrainer(
         LOG.info("Running evaluation step...")
         return super().evaluate(*args, **kwargs)
 
+    @override
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Override to defragment GPU memory after checkpoint saving."""
+        result = super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+        # Checkpoint save creates temporary CPU copies that fragment the CUDA
+        # allocator.  Without this, the first training step after save OOMs
+        # due to 9+ GiB of reserved-but-unallocated (fragmented) memory.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            LOG.debug("Called torch.cuda.empty_cache() after checkpoint save")
+        return result
+
     @staticmethod
     def orpo_concatenate_inputs(inputs, label_pad_token=-100, pad_token=0, device=None):
         concatenated_batch = {}

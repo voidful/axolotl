@@ -28,6 +28,9 @@ DATA_DIR="${PROJECT_DIR}/data/paper"
 RESULTS_DIR="${PROJECT_DIR}/results/paper"
 FIGURES_DIR="${PROJECT_DIR}/paper/figures"
 
+# Prevent CUDA memory fragmentation on 48GB GPUs (critical for checkpoint save+resume)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 PHASE="${1:-all}"
 
 echo "============================================"
