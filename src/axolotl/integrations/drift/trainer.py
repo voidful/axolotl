@@ -87,20 +87,37 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         ):
             del inputs["attention_mask"]
 
-        if num_items_in_batch is None and "labels" in inputs:
-            num_items_in_batch = (inputs["labels"] != -100).sum().item()
+        # Pop labels so the model forward skips internal loss (avoids fp32 upcast)
+        labels = inputs.pop("labels", None)
 
-        # Forward pass through active model
-        outputs = model(**inputs)
+        if num_items_in_batch is None and labels is not None:
+            num_items_in_batch = (labels != -100).sum().item()
+
+        # Forward pass — bypass accelerate's fp32 upcast to keep logits in bf16
+        import accelerate.utils.operations as accel_ops
+        original_convert = accel_ops.convert_to_fp32
+        accel_ops.convert_to_fp32 = lambda x: x
+        try:
+            outputs = model(**inputs)
+        finally:
+            accel_ops.convert_to_fp32 = original_convert
 
         # During eval, use standard CE loss (trust-region doesn't apply)
         if not model.training:
-            loss = outputs.loss if outputs.loss is not None else outputs[0]
+            if labels is not None:
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+            else:
+                loss = outputs.loss if outputs.loss is not None else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
-        active_logits = outputs.logits  # (B, T, V)
+        active_logits = outputs.logits  # (B, T, V) — stays in bf16
 
-        labels = inputs.get("labels", None)
         if labels is None:
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             return (loss, outputs) if return_outputs else loss
@@ -109,13 +126,14 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         valid_mask = labels != -100
 
         # 1. Compute drift-based reliability
+        # Avoid full-vocab log_softmax: use logsumexp + gather (only (B,T) intermediates)
         with torch.no_grad():
-            active_log_probs = F.log_softmax(active_logits, dim=-1)
             safe_labels = labels.clamp(min=0)
-            active_target_logp = active_log_probs.gather(
+            target_logit = active_logits.gather(
                 dim=-1, index=safe_labels.unsqueeze(-1)
             ).squeeze(-1)  # (B, T)
-            active_target_logp = active_target_logp * valid_mask.float()
+            lse = torch.logsumexp(active_logits, dim=-1)  # (B, T)
+            active_target_logp = (target_logit - lse) * valid_mask.float()
 
         drift = self.drift_buffer.get_current_drift(
             active_target_logp=active_target_logp,
