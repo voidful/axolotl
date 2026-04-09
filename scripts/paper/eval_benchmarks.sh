@@ -2,6 +2,7 @@
 # ============================================================
 # Drift-Trust Paper — Benchmark Evaluation Script
 # Battle A: MMLU-Pro + IFEval via lm-evaluation-harness
+# Backend: vLLM (PagedAttention, ~5-10x faster than HF generate)
 # ============================================================
 #
 # Usage:
@@ -25,17 +26,25 @@ mkdir -p "${OUTPUT_DIR}"
 echo "============================================"
 echo "Evaluating: ${RUN_NAME}"
 echo "Model: ${MODEL_PATH}"
+echo "Backend: vLLM"
 echo "Output: ${OUTPUT_DIR}"
 echo "============================================"
+
+# vLLM model args:
+#   gpu_memory_utilization=0.9  — use 90% of GPU memory for KV cache
+#   max_model_len=4096          — cap context length to fit in single GPU
+#   trust_remote_code=True      — required for Qwen3.5
+VLLM_ARGS="pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True,gpu_memory_utilization=0.9,max_model_len=4096"
 
 # --- MMLU-Pro ---
 echo ""
 echo "[1/2] Running MMLU-Pro..."
-lm_eval --model hf \
-    --model_args "pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True" \
+python -m lm_eval --model vllm \
+    --model_args "${VLLM_ARGS}" \
     --tasks mmlu_pro \
     --batch_size "${BATCH_SIZE}" \
     --num_fewshot 5 \
+    --gen_kwargs "max_gen_toks=256" \
     --output_path "${OUTPUT_DIR}/mmlu_pro" \
     --log_samples 2>&1 | tee "${OUTPUT_DIR}/mmlu_pro.log"
 
@@ -45,11 +54,12 @@ echo "[1/2] MMLU-Pro complete."
 # --- IFEval ---
 echo ""
 echo "[2/2] Running IFEval..."
-lm_eval --model hf \
-    --model_args "pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True" \
+python -m lm_eval --model vllm \
+    --model_args "${VLLM_ARGS}" \
     --tasks ifeval \
     --batch_size "${BATCH_SIZE}" \
     --num_fewshot 0 \
+    --gen_kwargs "max_gen_toks=512" \
     --output_path "${OUTPUT_DIR}/ifeval" \
     --log_samples 2>&1 | tee "${OUTPUT_DIR}/ifeval.log"
 
