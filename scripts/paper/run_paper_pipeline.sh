@@ -64,19 +64,25 @@ fi
 # ── Phase 2: Training ──────────────────────────────────────
 if [[ "${PHASE}" == "train" || "${PHASE}" == "all" ]]; then
     echo ""
-    echo "=== PHASE 2: Training (4 runs) ==="
+    echo "=== PHASE 2: Training (6 runs) ==="
 
-    echo "[1/4] CE on noisy UltraFeedback..."
+    echo "[1/6] CE on noisy UltraFeedback..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/ce_noisy_4b.yaml"
 
-    echo "[2/4] Drift-Trust on noisy UltraFeedback..."
+    echo "[2/6] Drift-Trust on noisy UltraFeedback..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_noisy_4b.yaml"
 
-    echo "[3/4] CE on NuminaMath-CoT..."
+    echo "[3/6] CE on NuminaMath-CoT..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/ce_math_4b.yaml"
 
-    echo "[4/4] Drift-Trust on NuminaMath-CoT..."
+    echo "[4/6] Drift-Trust on NuminaMath-CoT..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_math_4b.yaml"
+
+    echo "[5/6] Route C: Per-Sample Drift on noisy UltraFeedback..."
+    accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_noisy_4b_persample.yaml"
+
+    echo "[6/6] Route B: Aggressive Drift on noisy UltraFeedback..."
+    accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_noisy_4b_aggressive.yaml"
 
     echo "Phase 2 complete. Checkpoints saved."
 fi
@@ -98,6 +104,14 @@ if [[ "${PHASE}" == "eval" || "${PHASE}" == "all" ]]; then
     echo "[Battle A] Evaluating Drift-Trust (noisy)..."
     bash "${PAPER_SCRIPTS}/eval_benchmarks.sh" \
         "${PROJECT_DIR}/outputs/paper/drift-noisy-4b" "drift_noisy_4b"
+
+    echo "[Battle A] Evaluating Per-Sample Drift (noisy) — Route C..."
+    bash "${PAPER_SCRIPTS}/eval_benchmarks.sh" \
+        "${PROJECT_DIR}/outputs/paper/drift-noisy-4b-persample" "drift_noisy_persample"
+
+    echo "[Battle A] Evaluating Aggressive Drift (noisy) — Route B..."
+    bash "${PAPER_SCRIPTS}/eval_benchmarks.sh" \
+        "${PROJECT_DIR}/outputs/paper/drift-noisy-4b-aggressive" "drift_noisy_aggressive"
 
     # --- Battle B: MATH-500 Pass@k ---
     echo "[Battle B] Evaluating base model Pass@k..."

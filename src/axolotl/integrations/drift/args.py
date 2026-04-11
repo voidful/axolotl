@@ -44,6 +44,7 @@ class DriftArgs(BaseModel):
     drift_use_smooth_objective: bool | None = True
 
     # --- Drift buffer ---
+    drift_per_sample: bool | None = False  # Per-sample drift (avg CE per sample)
     drift_ema_decay: float | None = 0.999
     drift_gamma: float | None = 1.0
 
@@ -61,5 +62,6 @@ class DriftTrainingArgsMixin:
     drift_kl_lambda: float | None = 1.0
     drift_anchor_weight: float | None = 0.5
     drift_use_smooth_objective: bool | None = True
+    drift_per_sample: bool | None = False
     drift_ema_decay: float | None = 0.999
     drift_gamma: float | None = 1.0

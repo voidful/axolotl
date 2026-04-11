@@ -138,6 +138,7 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         drift = self.drift_buffer.get_current_drift(
             active_target_logp=active_target_logp,
             valid_mask=valid_mask,
+            per_sample=getattr(self.args, "drift_per_sample", False) or False,
         )
 
         r_t = compute_reliability_from_drift(

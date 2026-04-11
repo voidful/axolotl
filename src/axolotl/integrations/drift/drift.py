@@ -51,22 +51,39 @@ class DriftBuffer:
         self,
         active_target_logp: torch.Tensor,
         valid_mask: torch.Tensor,
+        per_sample: bool = False,
     ) -> torch.Tensor:
         """
         Compute per-token drift using the current running average (without updating it).
 
         drift_t = |log p_θ(y_t)|  (= CE_t since log p is negative)
 
+        When per_sample=True, uses sample-level mean CE instead of token-level CE.
+        This prevents novel-knowledge tokens (high CE) from being suppressed when
+        the surrounding context is coherent (low CE).
+
         Returns blended drift: 0.5 * instant + 0.5 * running_average.
 
         Args:
             active_target_logp: log p_θ(y_t), shape (B, T).
             valid_mask: Boolean mask for valid tokens, shape (B, T).
+            per_sample: If True, average CE per sample before reliability.
 
         Returns:
             Per-token drift values, shape (B, T).
         """
-        instant_drift = active_target_logp.abs()
+        instant_drift_raw = active_target_logp.abs()
+
+        if per_sample:
+            # Per-sample averaging: new knowledge tokens get "bailed out"
+            # by coherent context within the same sample
+            sample_sum = (instant_drift_raw * valid_mask.float()).sum(dim=1, keepdim=True)
+            sample_valid_len = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1e-5)
+            sample_mean_drift = sample_sum / sample_valid_len
+            instant_drift = sample_mean_drift.expand_as(instant_drift_raw)
+        else:
+            instant_drift = instant_drift_raw
+
         blended_drift = (
             0.5 * instant_drift
             + 0.5 * self._running_drift
