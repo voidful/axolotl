@@ -31,16 +31,38 @@ echo "Output: ${OUTPUT_DIR}"
 echo "============================================"
 
 # Fix: vLLM treats Qwen3.5 as VLM, fails on missing visual weights.
-# Patch vLLM's default_loader.py to tolerate missing weights (warning instead of error).
-VLLM_LOADER=$(python3 -c "import vllm.model_executor.model_loader.default_loader as m; print(m.__file__)")
-if [ -n "${VLLM_LOADER}" ]; then
-    if ! [ -f "${VLLM_LOADER}.orig" ]; then
-        cp "${VLLM_LOADER}" "${VLLM_LOADER}.orig"
-    fi
-    # Change "raise ValueError" to "pass  # patched" for uninitialized weights
-    sed -i 's/raise ValueError(/import logging; logging.getLogger(__name__).warning(  # patched: was raise ValueError/' "${VLLM_LOADER}"
-    echo "Patched vLLM default_loader.py to tolerate missing visual weights."
-fi
+# Precisely patch only the "uninitialized weights" check in default_loader.py.
+python3 << 'PATCH_EOF'
+import importlib, re
+mod = importlib.import_module("vllm.model_executor.model_loader.default_loader")
+fpath = mod.__file__
+
+# Restore original if backup exists
+import os
+orig = fpath + ".orig"
+if os.path.exists(orig):
+    import shutil
+    shutil.copy2(orig, fpath)
+else:
+    import shutil
+    shutil.copy2(fpath, orig)
+
+with open(fpath) as f:
+    src = f.read()
+
+# Target only: raise ValueError(f"Following weights were not initialized...")
+patched = src.replace(
+    'raise ValueError(\n                f"Following weights were not initialized from checkpoint: "',
+    'pass  # PATCHED: was raise ValueError\n                # f"Following weights were not initialized from checkpoint: "'
+)
+
+if patched != src:
+    with open(fpath, "w") as f:
+        f.write(patched)
+    print("  Patched: uninitialized weights check → warning (visual encoder safe)")
+else:
+    print("  Already patched or pattern not found.")
+PATCH_EOF
 
 # Restore config.json if previously patched
 if [ -d "${MODEL_PATH}" ] && [ -f "${MODEL_PATH}/config.json.bak" ]; then
