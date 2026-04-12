@@ -34,7 +34,8 @@ echo "============================================"
 #   gpu_memory_utilization=0.9  — use 90% of GPU memory for KV cache
 #   max_model_len=4096          — cap context length to fit in single GPU
 #   trust_remote_code=True      — required for Qwen3.5
-VLLM_ARGS="pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True,gpu_memory_utilization=0.9,max_model_len=4096"
+#   hf_overrides — force text-only CausalLM (vLLM may default to VLM for Qwen3.5)
+VLLM_ARGS='pretrained='"${MODEL_PATH}"',dtype=bfloat16,trust_remote_code=True,gpu_memory_utilization=0.9,max_model_len=4096,hf_overrides={"architectures":["Qwen3_5ForCausalLM"]}'
 
 # --- MMLU-Pro ---
 echo ""
