@@ -30,23 +30,15 @@ echo "Backend: vLLM"
 echo "Output: ${OUTPUT_DIR}"
 echo "============================================"
 
-# Fix: vLLM >= 0.8 treats Qwen3.5 as VLM (with visual encoder), but our
-# checkpoints are text-only. Patch config.json to use Qwen2ForCausalLM.
-if [ -d "${MODEL_PATH}" ] && [ -f "${MODEL_PATH}/config.json" ]; then
-    echo "Patching config.json: Qwen3_5 → Qwen2 (text-only for vLLM)..."
-    python3 -c "
-import json, shutil
-cfg = '${MODEL_PATH}/config.json'
-shutil.copy2(cfg, cfg + '.bak')
-with open(cfg) as f: d = json.load(f)
-if 'Qwen3_5' in str(d.get('architectures', [])):
-    d['architectures'] = ['Qwen2ForCausalLM']
-    d['model_type'] = 'qwen2'
-    with open(cfg, 'w') as f: json.dump(d, f, indent=2)
-    print('  Patched: Qwen3_5ForCausalLM → Qwen2ForCausalLM')
-else:
-    print('  No patch needed.')
-"
+# Fix: vLLM v1 treats Qwen3.5 as VLM (with visual encoder), but our
+# checkpoints are text-only. Use v0 engine which handles this correctly.
+export VLLM_USE_V1=0
+
+# Restore config.json if previously patched
+if [ -d "${MODEL_PATH}" ] && [ -f "${MODEL_PATH}/config.json.bak" ]; then
+    echo "Restoring original config.json from backup..."
+    cp "${MODEL_PATH}/config.json.bak" "${MODEL_PATH}/config.json"
+    rm -f "${MODEL_PATH}/config.json.bak"
 fi
 
 VLLM_ARGS="pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True,gpu_memory_utilization=0.9,max_model_len=4096"
