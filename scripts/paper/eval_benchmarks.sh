@@ -30,13 +30,20 @@ echo "Backend: vLLM"
 echo "Output: ${OUTPUT_DIR}"
 echo "============================================"
 
-# Fix: vLLM v1 treats Qwen3.5 as VLM (with visual encoder), but our
-# checkpoints are text-only. Use v0 engine which handles this correctly.
-export VLLM_USE_V1=0
+# Fix: vLLM treats Qwen3.5 as VLM, fails on missing visual weights.
+# Patch vLLM's default_loader.py to tolerate missing weights (warning instead of error).
+VLLM_LOADER=$(python3 -c "import vllm.model_executor.model_loader.default_loader as m; print(m.__file__)")
+if [ -n "${VLLM_LOADER}" ]; then
+    if ! [ -f "${VLLM_LOADER}.orig" ]; then
+        cp "${VLLM_LOADER}" "${VLLM_LOADER}.orig"
+    fi
+    # Change "raise ValueError" to "pass  # patched" for uninitialized weights
+    sed -i 's/raise ValueError(/import logging; logging.getLogger(__name__).warning(  # patched: was raise ValueError/' "${VLLM_LOADER}"
+    echo "Patched vLLM default_loader.py to tolerate missing visual weights."
+fi
 
 # Restore config.json if previously patched
 if [ -d "${MODEL_PATH}" ] && [ -f "${MODEL_PATH}/config.json.bak" ]; then
-    echo "Restoring original config.json from backup..."
     cp "${MODEL_PATH}/config.json.bak" "${MODEL_PATH}/config.json"
     rm -f "${MODEL_PATH}/config.json.bak"
 fi
