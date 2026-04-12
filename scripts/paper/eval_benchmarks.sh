@@ -30,45 +30,11 @@ echo "Backend: vLLM"
 echo "Output: ${OUTPUT_DIR}"
 echo "============================================"
 
-# Fix: vLLM treats Qwen3.5 as VLM, fails on missing visual weights.
-# Precisely patch only the "uninitialized weights" check in default_loader.py.
-python3 << 'PATCH_EOF'
-import importlib, re
-mod = importlib.import_module("vllm.model_executor.model_loader.default_loader")
-fpath = mod.__file__
-
-# Restore original if backup exists
-import os
-orig = fpath + ".orig"
-if os.path.exists(orig):
-    import shutil
-    shutil.copy2(orig, fpath)
-else:
-    import shutil
-    shutil.copy2(fpath, orig)
-
-with open(fpath) as f:
-    src = f.read()
-
-# Target only: raise ValueError(f"Following weights were not initialized...")
-patched = src.replace(
-    'raise ValueError(\n                f"Following weights were not initialized from checkpoint: "',
-    'pass  # PATCHED: was raise ValueError\n                # f"Following weights were not initialized from checkpoint: "'
-)
-
-if patched != src:
-    with open(fpath, "w") as f:
-        f.write(patched)
-    print("  Patched: uninitialized weights check → warning (visual encoder safe)")
-else:
-    print("  Already patched or pattern not found.")
-PATCH_EOF
-
-# Restore config.json if previously patched
-if [ -d "${MODEL_PATH}" ] && [ -f "${MODEL_PATH}/config.json.bak" ]; then
-    cp "${MODEL_PATH}/config.json.bak" "${MODEL_PATH}/config.json"
-    rm -f "${MODEL_PATH}/config.json.bak"
-fi
+# NOTE: If vLLM fails with "weights not initialized from checkpoint" for visual.*,
+# run this ONCE on the server to patch vLLM:
+#   cp /home/voidful/.local/lib/python3.10/site-packages/vllm/model_executor/model_loader/default_loader.py.orig \
+#      /home/voidful/.local/lib/python3.10/site-packages/vllm/model_executor/model_loader/default_loader.py
+#   Then apply the precise patch (see README).
 
 VLLM_ARGS="pretrained=${MODEL_PATH},dtype=bfloat16,trust_remote_code=True,gpu_memory_utilization=0.9,max_model_len=4096"
 
