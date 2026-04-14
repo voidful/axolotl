@@ -39,14 +39,14 @@ class DriftArgs(BaseModel):
     # --- Trust-region hyperparameters ---
     drift_epsilon_min: float | None = 0.01
     drift_epsilon_max: float | None = 1.0
-    drift_kl_lambda: float | None = 1.0
-    drift_anchor_weight: float | None = 0.5  # baseline CE floor weight
+    drift_kl_lambda: float | None = 4.0  # modulation strength for clean tokens
+    drift_anchor_weight: float | None = 0.1  # near-zero gradient floor for noisy tokens
     drift_use_smooth_objective: bool | None = True
 
     # --- Drift buffer ---
     drift_per_sample: bool | None = False  # Per-sample drift (avg CE per sample)
-    drift_ema_decay: float | None = 0.999
-    drift_gamma: float | None = 1.0
+    drift_ema_decay: float | None = 0.99  # faster adaptation
+    drift_gamma: float | None = 3.0  # sensitive to CE deviation
 
 
 @dataclass
@@ -59,9 +59,9 @@ class DriftTrainingArgsMixin:
     drift_reliability_tau: float | None = 1.0
     drift_epsilon_min: float | None = 0.01
     drift_epsilon_max: float | None = 1.0
-    drift_kl_lambda: float | None = 1.0
-    drift_anchor_weight: float | None = 0.5
+    drift_kl_lambda: float | None = 4.0
+    drift_anchor_weight: float | None = 0.1
     drift_use_smooth_objective: bool | None = True
     drift_per_sample: bool | None = False
-    drift_ema_decay: float | None = 0.999
-    drift_gamma: float | None = 1.0
+    drift_ema_decay: float | None = 0.99
+    drift_gamma: float | None = 3.0

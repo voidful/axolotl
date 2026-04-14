@@ -1,6 +1,6 @@
-# Drift-Trust Paper — Default Drift-Trust on Noisy UltraFeedback
-# Battle A: Mitigating Alignment Tax
-# Model: Qwen3.5-4B with Drift-Trust loss (recommended hyperparameters)
+# Drift-Trust Paper — ABLATION: Conservative hyperparameters
+# Purpose: Demonstrate that low anchor_weight and high lambda are critical
+# Model: Qwen3.5-4B with conservative (weak) drift parameters
 
 base_model: Qwen/Qwen3.5-4B
 low_cpu_mem_usage: true
@@ -12,17 +12,17 @@ plugins:
 liger_rms_norm: true
 liger_glu_activation: true
 
-# --- Drift-Trust hyperparameters (recommended) ---
+# --- Drift-Trust hyperparameters (conservative / weak) ---
 drift_trainer: true
 drift_reliability_beta: 0.5
 drift_reliability_tau: 1.0
 drift_epsilon_min: 0.01
 drift_epsilon_max: 1.0
-drift_kl_lambda: 4.0              # strong modulation for clean tokens
+drift_kl_lambda: 1.0              # weak modulation (ablation)
 drift_use_smooth_objective: true
-drift_ema_decay: 0.99             # fast adaptation
-drift_gamma: 3.0                  # sensitive to CE deviation
-drift_anchor_weight: 0.1          # near-zero gradient floor for noisy tokens
+drift_ema_decay: 0.999            # slow adaptation (ablation)
+drift_gamma: 1.0                  # low sensitivity (ablation)
+drift_anchor_weight: 0.5          # high floor = weak noise suppression (ablation)
 
 datasets:
   - path: ./data/paper/ultrafeedback_noisy_25pct_10k.jsonl
@@ -31,7 +31,7 @@ datasets:
     field_messages: conversations
     split: train
 
-dataset_prepared_path: ./prepared_data/paper/drift_noisy_4b
+dataset_prepared_path: ./prepared_data/paper/drift_noisy_4b_conservative
 
 chat_template: qwen3_5
 
@@ -56,6 +56,6 @@ dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
 eval_strategy: epoch
-output_dir: ./outputs/paper/drift-noisy-4b
+output_dir: ./outputs/paper/drift-noisy-4b-conservative
 
 logging_steps: 1
