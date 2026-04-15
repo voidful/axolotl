@@ -244,7 +244,7 @@ phase_train() {
             echo "  Config: ${config}"
             echo "  Output: ${output_dir}"
 
-            accelerate launch -m axolotl.cli.train "${config}"
+            python3 -m accelerate.commands.launch -m axolotl.cli.train "${config}"
 
             echo "[${run_num}/${total_runs}] ${method} noise=${noise}% — DONE"
             echo ""
