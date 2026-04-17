@@ -328,8 +328,14 @@ phase_efficiency() {
     echo "=== PHASE 4: Efficiency Measurement ==="
     mkdir -p "${RESULTS_DIR}/efficiency"
 
+    # Build list of configs to measure (CE + Drift default at 25% noise)
+    local ce_config="${PAPER_CONFIGS}/ce_noisy_4b.yaml"
+    local drift_config="${PAPER_CONFIGS}/drift_noisy_4b.yaml"
+
     if [ -f "${PAPER_SCRIPTS}/measure_efficiency.py" ]; then
-        python "${PAPER_SCRIPTS}/measure_efficiency.py" \
+        python3 "${PAPER_SCRIPTS}/measure_efficiency.py" \
+            --configs "${ce_config}" "${drift_config}" \
+            --max_steps 50 \
             --output_dir "${RESULTS_DIR}/efficiency"
     else
         echo "WARNING: measure_efficiency.py not found, skipping."

@@ -30,7 +30,7 @@ def run_training_check(config_path: str, max_steps: int = 50, output_dir: str = 
 
     # Override output dir and steps for efficiency measurement
     cmd = [
-        "accelerate", "launch", "-m", "axolotl.cli.train",
+        "python3", "-m", "accelerate.commands.launch", "-m", "axolotl.cli.train",
         config_path,
         "--max_steps", str(max_steps),
         "--output_dir", os.path.join(output_dir, run_name),
