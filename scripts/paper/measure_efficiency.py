@@ -7,7 +7,7 @@ Runs a short training check (50 steps) with each config and records:
   - Training throughput in tokens/second
   - Wall-clock time per step
 
-Used to fill Table 2 in the Drift-Trust paper.
+Used to fill the efficiency table in the Drift-Trust paper.
 
 Usage:
     python measure_efficiency.py \
@@ -19,21 +19,45 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
 
-def run_training_check(config_path: str, max_steps: int = 50, output_dir: str = "/tmp/efficiency_check"):
-    """Run a short training and capture efficiency metrics."""
-    run_name = Path(config_path).stem
+def poll_gpu_memory(stop_event, results_dict, interval=2.0):
+    """Background thread: poll nvidia-smi for peak GPU VRAM usage."""
+    peak_mb = 0
+    while not stop_event.is_set():
+        try:
+            smi = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in smi.stdout.strip().split("\n"):
+                if line.strip():
+                    mb = float(line.strip())
+                    peak_mb = max(peak_mb, mb)
+        except Exception:
+            pass
+        stop_event.wait(interval)
+    results_dict["peak_vram_mb"] = peak_mb
 
-    # Override output dir and steps for efficiency measurement
+
+def run_training_check(config_path: str, max_steps: int = 50, output_dir: str = "/tmp/efficiency_check"):
+    """Run a short training and capture efficiency metrics via streaming output."""
+    run_name = Path(config_path).stem
+    run_output_dir = os.path.join(output_dir, run_name)
+    log_path = os.path.join(output_dir, f"{run_name}.log")
+
     cmd = [
-        "python3", "-m", "accelerate.commands.launch", "-m", "axolotl.cli.train",
+        sys.executable, "-m", "accelerate.commands.launch",
+        "-m", "axolotl.cli.train",
         config_path,
         "--max_steps", str(max_steps),
-        "--output_dir", os.path.join(output_dir, run_name),
+        "--output_dir", run_output_dir,
         "--save_strategy", "no",
         "--eval_strategy", "no",
         "--report_to", "none",
@@ -43,57 +67,89 @@ def run_training_check(config_path: str, max_steps: int = 50, output_dir: str = 
     print(f"Measuring efficiency: {run_name}")
     print(f"Config: {config_path}")
     print(f"Max steps: {max_steps}")
+    print(f"Log: {log_path}")
     print(f"{'='*60}")
 
+    # Start GPU memory polling in background
+    stop_event = threading.Event()
+    gpu_results = {}
+    gpu_thread = threading.Thread(target=poll_gpu_memory, args=(stop_event, gpu_results), daemon=True)
+    gpu_thread.start()
+
+    # Run training with streaming output (no capture deadlock)
+    tokens_per_sec = None
+    loss_values = []
     start_time = time.time()
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=600,  # 10 min timeout
-    )
+
+    with open(log_path, "w") as logf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        for line in proc.stdout:
+            # Write to log file
+            logf.write(line)
+            logf.flush()
+
+            # Print to console (so user can see progress)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+            # Parse throughput from training output
+            # Typical format: "{'loss': 1.23, ... 'tokens_per_second': 4567, ...}"
+            if "tokens_per_second" in line.lower() or "tok/s" in line.lower():
+                numbers = re.findall(r'tokens_per_second[\'"\s:]+(\d+\.?\d*)', line, re.IGNORECASE)
+                if numbers:
+                    tokens_per_sec = float(numbers[-1])
+
+            # Also try to catch throughput from different log formats
+            if "samples/s" in line.lower() or "it/s" in line.lower():
+                match = re.search(r'(\d+\.?\d*)\s*(?:samples/s|it/s)', line)
+                if match and tokens_per_sec is None:
+                    # Rough estimate: samples/s × seq_len ≈ tokens/s
+                    pass  # Can't reliably convert without knowing seq_len
+
+            # Parse loss
+            loss_match = re.search(r"'loss':\s*(\d+\.?\d*)", line)
+            if loss_match:
+                loss_values.append(float(loss_match.group(1)))
+
+        proc.wait()
+
     wall_time = time.time() - start_time
 
-    # Parse GPU memory from output
-    peak_vram_gb = None
-    tokens_per_sec = None
+    # Stop GPU polling
+    stop_event.set()
+    gpu_thread.join(timeout=5)
 
-    for line in result.stdout.split("\n") + result.stderr.split("\n"):
-        # Look for memory usage in log
-        if "peak" in line.lower() and ("memory" in line.lower() or "vram" in line.lower()):
-            import re
-            numbers = re.findall(r'[\d.]+', line)
-            if numbers:
-                peak_vram_gb = float(numbers[-1])
+    peak_vram_gb = gpu_results.get("peak_vram_mb", 0) / 1024 if gpu_results.get("peak_vram_mb") else None
 
-        # Look for throughput
-        if "tokens" in line.lower() and ("sec" in line.lower() or "/s" in line.lower()):
-            import re
-            numbers = re.findall(r'[\d.]+', line)
-            if numbers:
-                tokens_per_sec = float(numbers[0])
-
-    # If not found in logs, try nvidia-smi
-    if peak_vram_gb is None:
+    # If tokens_per_sec not found in streaming output, scan log file
+    if tokens_per_sec is None:
         try:
-            smi = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True
-            )
-            vram_values = [float(x) / 1024 for x in smi.stdout.strip().split("\n") if x.strip()]
-            peak_vram_gb = max(vram_values) if vram_values else None
-        except (FileNotFoundError, ValueError):
+            with open(log_path) as f:
+                for line in f:
+                    tps_match = re.search(r"tokens_per_second['\"\s:]+(\d+\.?\d*)", line, re.IGNORECASE)
+                    if tps_match:
+                        tokens_per_sec = float(tps_match.group(1))
+        except Exception:
             pass
 
     return {
         "config": config_path,
         "run_name": run_name,
         "max_steps": max_steps,
-        "wall_time_seconds": wall_time,
-        "time_per_step": wall_time / max_steps,
-        "peak_vram_gb": peak_vram_gb,
-        "tokens_per_sec": tokens_per_sec,
-        "exit_code": result.returncode,
+        "wall_time_seconds": round(wall_time, 1),
+        "time_per_step": round(wall_time / max_steps, 2) if max_steps > 0 else None,
+        "peak_vram_gb": round(peak_vram_gb, 2) if peak_vram_gb else None,
+        "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else None,
+        "final_loss": round(loss_values[-1], 4) if loss_values else None,
+        "exit_code": proc.returncode,
+        "log_path": log_path,
     }
 
 
@@ -114,7 +170,8 @@ def main():
             results.append(metrics)
             print(f"\n  Peak VRAM: {metrics['peak_vram_gb']} GB")
             print(f"  Throughput: {metrics['tokens_per_sec']} tokens/s")
-            print(f"  Time/step: {metrics['time_per_step']:.2f}s")
+            print(f"  Time/step: {metrics['time_per_step']}s")
+            print(f"  Wall time: {metrics['wall_time_seconds']}s")
         except Exception as e:
             print(f"  ERROR: {e}")
             results.append({"config": config, "error": str(e)})
