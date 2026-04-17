@@ -380,15 +380,21 @@ for run_dir in sorted(glob.glob(os.path.join(bench_dir, "*"))):
     run_data = {}
 
     for task in ["mmlu_pro", "ifeval"]:
-        # Search recursively: lm-eval creates nested dirs like mmlu_pro/.__model_path__/results_*.json
+        # Use os.walk instead of glob — glob skips hidden dirs (.__model_path__)
         task_dir = os.path.join(run_dir, task)
-        result_files = glob.glob(os.path.join(task_dir, "**", "results_*.json"), recursive=True)
+        result_files = []
+        if os.path.isdir(task_dir):
+            for root, dirs, files in os.walk(task_dir):
+                for f in files:
+                    if f.startswith("results_") and f.endswith(".json"):
+                        result_files.append(os.path.join(root, f))
         if not result_files:
-            result_files = glob.glob(os.path.join(task_dir, "results_*.json"))
-        if not result_files:
-            # Last resort: search entire run_dir for any results JSON
-            result_files = [f for f in glob.glob(os.path.join(run_dir, "**", "results_*.json"), recursive=True)
-                           if task in f.lower()]
+            # Fallback: search entire run_dir
+            if os.path.isdir(run_dir):
+                for root, dirs, files in os.walk(run_dir):
+                    for f in files:
+                        if f.startswith("results_") and f.endswith(".json") and task in root.lower():
+                            result_files.append(os.path.join(root, f))
         if not result_files:
             continue
         try:
