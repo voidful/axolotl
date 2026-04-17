@@ -380,12 +380,15 @@ for run_dir in sorted(glob.glob(os.path.join(bench_dir, "*"))):
     run_data = {}
 
     for task in ["mmlu_pro", "ifeval"]:
-        # Search recursively: results might be nested
+        # Search recursively: lm-eval creates nested dirs like mmlu_pro/.__model_path__/results_*.json
         task_dir = os.path.join(run_dir, task)
         result_files = glob.glob(os.path.join(task_dir, "**", "results_*.json"), recursive=True)
         if not result_files:
-            # Also try flat structure
             result_files = glob.glob(os.path.join(task_dir, "results_*.json"))
+        if not result_files:
+            # Last resort: search entire run_dir for any results JSON
+            result_files = [f for f in glob.glob(os.path.join(run_dir, "**", "results_*.json"), recursive=True)
+                           if task in f.lower()]
         if not result_files:
             continue
         try:
@@ -394,7 +397,8 @@ for run_dir in sorted(glob.glob(os.path.join(bench_dir, "*"))):
             results = data.get("results", {})
             for task_name, metrics in results.items():
                 for metric, value in metrics.items():
-                    if isinstance(value, (int, float)) and ("acc" in metric.lower() or "score" in metric.lower()):
+                    if isinstance(value, (int, float)) and \
+                       ("acc" in metric.lower() or "score" in metric.lower() or "match" in metric.lower()):
                         run_data[f"{task_name}/{metric}"] = value
         except Exception as e:
             print(f"  WARNING: Failed to parse {result_files[0]}: {e}")
