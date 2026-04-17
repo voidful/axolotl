@@ -362,31 +362,57 @@ print("\n" + "=" * 80)
 print("  DRIFT-TRUST FULL EXPERIMENT RESULTS")
 print("=" * 80)
 
-# Collect all results
+# Debug: show what directories exist
+print(f"\nScanning: {bench_dir}")
+if os.path.isdir(bench_dir):
+    subdirs = sorted(os.listdir(bench_dir))
+    print(f"Found {len(subdirs)} result directories: {subdirs}")
+else:
+    print(f"WARNING: {bench_dir} does not exist!")
+    subdirs = []
+
+# Collect all results — search recursively for results_*.json
 all_results = {}
 for run_dir in sorted(glob.glob(os.path.join(bench_dir, "*"))):
+    if not os.path.isdir(run_dir):
+        continue
     run_name = os.path.basename(run_dir)
     run_data = {}
 
     for task in ["mmlu_pro", "ifeval"]:
+        # Search recursively: results might be nested
         task_dir = os.path.join(run_dir, task)
-        result_files = glob.glob(os.path.join(task_dir, "results_*.json"))
+        result_files = glob.glob(os.path.join(task_dir, "**", "results_*.json"), recursive=True)
+        if not result_files:
+            # Also try flat structure
+            result_files = glob.glob(os.path.join(task_dir, "results_*.json"))
         if not result_files:
             continue
-        with open(result_files[0]) as f:
-            data = json.load(f)
-        results = data.get("results", {})
-        for task_name, metrics in results.items():
-            for metric, value in metrics.items():
-                if isinstance(value, (int, float)) and ("acc" in metric.lower() or "score" in metric.lower()):
-                    run_data[f"{task_name}/{metric}"] = value
+        try:
+            with open(result_files[0]) as f:
+                data = json.load(f)
+            results = data.get("results", {})
+            for task_name, metrics in results.items():
+                for metric, value in metrics.items():
+                    if isinstance(value, (int, float)) and ("acc" in metric.lower() or "score" in metric.lower()):
+                        run_data[f"{task_name}/{metric}"] = value
+        except Exception as e:
+            print(f"  WARNING: Failed to parse {result_files[0]}: {e}")
 
     if run_data:
         all_results[run_name] = run_data
+        print(f"  ✓ {run_name}: {len(run_data)} metrics loaded")
+    else:
+        print(f"  ✗ {run_name}: no metrics found")
 
-# Print main table
+if not all_results:
+    print("\nNo results found! Check that benchmark results exist in:")
+    print(f"  {bench_dir}/<run_name>/mmlu_pro/results_*.json")
+    print(f"  {bench_dir}/<run_name>/ifeval/results_*.json")
+
+# --- Main Table: all configs ---
 print("\n--- Main Results: MMLU-Pro + IFEval ---\n")
-header = f"{'Config':<25} {'MMLU-Pro':>10} {'IFEval Strict':>15} {'IFEval Loose':>15}"
+header = f"{'Config':<30} {'MMLU-Pro':>10} {'IFEval Strict':>15} {'IFEval Loose':>15}"
 print(header)
 print("-" * len(header))
 
@@ -397,31 +423,68 @@ for name, data in sorted(all_results.items()):
     mmlu_str = f"{mmlu:.4f}" if mmlu is not None else "N/A"
     ifeval_s_str = f"{ifeval_s:.4f}" if ifeval_s is not None else "N/A"
     ifeval_l_str = f"{ifeval_l:.4f}" if ifeval_l is not None else "N/A"
-    print(f"{name:<25} {mmlu_str:>10} {ifeval_s_str:>15} {ifeval_l_str:>15}")
+    print(f"{name:<30} {mmlu_str:>10} {ifeval_s_str:>15} {ifeval_l_str:>15}")
 
-# Print noise sweep table
+# --- Noise Sweep Table ---
+# Map old naming conventions to noise levels
+NAME_TO_NOISE = {
+    # New sweep naming
+    "ce_noise0": ("ce", 0), "drift_noise0": ("drift", 0),
+    "ce_noise10": ("ce", 10), "drift_noise10": ("drift", 10),
+    "ce_noise25": ("ce", 25), "drift_noise25": ("drift", 25),
+    "ce_noise50": ("ce", 50), "drift_noise50": ("drift", 50),
+    "ce_noise75": ("ce", 75), "drift_noise75": ("drift", 75),
+    # Old naming (from previous runs, all 25% noise)
+    "ce_noisy_4b": ("ce", 25),
+    "qwen35_4b_base": ("base", -1),
+    # Drift-Trust variants at 25% noise
+    "drift_noisy_4b": ("drift_conservative", 25),
+    "drift_noisy_aggressive": ("drift", 25),
+    "drift_noisy_persample": ("drift_persample", 25),
+    "drift_conservative": ("drift_conservative", 25),
+    "drift_persample": ("drift_persample", 25),
+}
+
+# Group results by (method, noise_level)
+grouped = {}
+for name, data in all_results.items():
+    method, noise = NAME_TO_NOISE.get(name, (name, -1))
+    grouped[(method, noise)] = data
+
 print("\n--- Noise Level Sweep ---\n")
 print(f"{'Noise %':<10} {'CE MMLU':>10} {'Drift MMLU':>12} {'CE IFEval':>12} {'Drift IFEval':>14} {'Δ MMLU':>8} {'Δ IFEval':>10}")
 print("-" * 80)
 
+def fmt(v):
+    return f"{v:.4f}" if v is not None else "---"
+
 for noise in [0, 10, 25, 50, 75]:
-    ce_key = f"ce_noise{noise}"
-    dr_key = f"drift_noise{noise}"
-    ce = all_results.get(ce_key, {})
-    dr = all_results.get(dr_key, {})
+    ce = grouped.get(("ce", noise), {})
+    dr = grouped.get(("drift", noise), {})
 
     ce_mmlu = ce.get("mmlu_pro/exact_match,custom-extract")
     dr_mmlu = dr.get("mmlu_pro/exact_match,custom-extract")
     ce_if = ce.get("ifeval/prompt_level_strict_acc,none")
     dr_if = dr.get("ifeval/prompt_level_strict_acc,none")
 
-    def fmt(v):
-        return f"{v:.4f}" if v is not None else "---"
-
-    delta_mmlu = f"{(dr_mmlu - ce_mmlu):+.4f}" if (dr_mmlu and ce_mmlu) else "---"
-    delta_if = f"{(dr_if - ce_if):+.4f}" if (dr_if and ce_if) else "---"
+    delta_mmlu = f"{(dr_mmlu - ce_mmlu):+.4f}" if (dr_mmlu is not None and ce_mmlu is not None) else "---"
+    delta_if = f"{(dr_if - ce_if):+.4f}" if (dr_if is not None and ce_if is not None) else "---"
 
     print(f"{noise:>5}%    {fmt(ce_mmlu):>10} {fmt(dr_mmlu):>12} {fmt(ce_if):>12} {fmt(dr_if):>14} {delta_mmlu:>8} {delta_if:>10}")
+
+# --- Ablation Table ---
+print("\n--- Ablation (25% noise) ---\n")
+print(f"{'Variant':<25} {'MMLU-Pro':>10} {'IFEval Strict':>15}")
+print("-" * 55)
+
+ablation_order = [("base", -1, "Base (no fine-tune)"), ("ce", 25, "Standard CE"), ("drift", 25, "Drift-Trust (Ours)"),
+                  ("drift_conservative", 25, "  Conservative (w=0.5)"), ("drift_persample", 25, "  Sample-level")]
+for method, noise, label in ablation_order:
+    data = grouped.get((method, noise), {})
+    mmlu = data.get("mmlu_pro/exact_match,custom-extract")
+    ifeval_s = data.get("ifeval/prompt_level_strict_acc,none")
+    if mmlu is not None or ifeval_s is not None:
+        print(f"{label:<25} {fmt(mmlu):>10} {fmt(ifeval_s):>15}")
 
 # Save to JSON
 summary_path = os.path.join(results_dir, "full_results_summary.json")
