@@ -1,0 +1,56 @@
+# RCCA-TR Paper — Drift (legacy trust-region, Medical)
+# Mode: drift (ablation — original trust-region formulation)
+
+base_model: Qwen/Qwen3.5-4B
+low_cpu_mem_usage: true
+
+plugins:
+  - axolotl.integrations.rcca_tr.RCCATRPlugin
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rms_norm: true
+liger_glu_activation: true
+
+rcca_tr_trainer: true
+rcca_tr_mode: drift
+rcca_tr_ema_decay: 0.999
+rcca_tr_drift_gamma: 1.0
+rcca_tr_reliability_tau: 1.0
+rcca_tr_kl_lambda: 4.0
+rcca_tr_anchor_weight: 0.1
+
+datasets:
+  - path: ./data/paper/medical_flashcards_10k.jsonl
+    ds_type: json
+    type: chat_template
+    field_messages: conversations
+    split: train
+
+dataset_prepared_path: ./prepared_data/paper/rcca_drift_medical_4b
+chat_template: qwen3_5
+
+sequence_len: 4096
+sample_packing: true
+pad_to_sequence_len: false
+
+gradient_accumulation_steps: 8
+micro_batch_size: 1
+num_epochs: 3
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2e-5
+warmup_ratio: 0.03
+weight_decay: 0.01
+seed: 42
+
+bf16: true
+gradient_checkpointing: true
+flash_attention: true
+dataloader_num_workers: 4
+
+val_set_size: 0.05
+save_strategy: epoch
+eval_strategy: epoch
+output_dir: ./outputs/paper/rcca-drift-medical-4b
+
+logging_steps: 1
