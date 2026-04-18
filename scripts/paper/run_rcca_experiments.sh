@@ -152,6 +152,7 @@ dataloader_num_workers: 4
 val_set_size: 0.05
 save_strategy: epoch
 eval_strategy: epoch
+save_total_limit: 1
 output_dir: ${output_dir}
 
 logging_steps: 1
