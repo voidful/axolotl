@@ -13,16 +13,17 @@
 # limitations under the License.
 
 """
-Unified loss dispatch for RCCA-TR.
+Unified loss dispatch for Drift-Trust.
 
-Four modes, one entry point:
+A shared drift signal + two transfer functions:
 
-  ce         — Standard cross-entropy (baseline).
-  hardness   — Self-paced hardness weighting: w_t = w_min + (1-w_min)·s_t
-  drift_only — Self-paced + drift:  w_t = w_min + (1-w_min)·(β·s_t + (1-β)·r_t)
-  drift      — Legacy trust-region: L = (anchor + λ·r_t)·CE_t
+  ce            — Standard cross-entropy (baseline).
+  hardness      — Self-paced hardness weighting: w_t = w_min + (1-w_min)·s_t
+  drift_trust_s — Suppressive: w_t = w_min + (1-w_min)·(β·s_t + (1-β)·r_t)
+  drift_trust_a — Anchoring:   w_t = w_0 + λ·r_t
 
-Main method: ``drift_only``.
+Suppressive drift suppresses unreliable tokens (w ∈ [0.05, 1.0]).
+Anchoring drift amplifies knowledge anchors (w ∈ [0.1, 4.1]).
 """
 
 from __future__ import annotations
@@ -103,13 +104,13 @@ def compute_self_paced_score(
     return s_t * valid_mask.float()
 
 
-def compute_drift_score(
+def compute_suppressive_drift_score(
     drift: torch.Tensor,
     valid_mask: torch.Tensor,
     tau: float = 1.0,
 ) -> torch.Tensor:
     """
-    Drift-based reliability score.
+    Suppressive drift score for Drift-Trust-S.
 
     r_t = σ((d_t − μ) / τ)
 
@@ -117,7 +118,7 @@ def compute_drift_score(
     Negative drift (harder than history) → r_t ≈ 0 (suspicious, suppress).
 
     Args:
-        drift: Per-token drift from DriftBuffer, shape (B, T).
+        drift: Per-token signed drift from DriftBuffer, shape (B, T).
         valid_mask: Boolean mask, shape (B, T).
         tau: Temperature for sigmoid normalization.
 
@@ -130,6 +131,41 @@ def compute_drift_score(
         mu = drift.mean()
 
     r_t = torch.sigmoid((drift - mu) / tau)
+    return r_t * valid_mask.float()
+
+
+def compute_anchoring_drift_score(
+    drift: torch.Tensor,
+    valid_mask: torch.Tensor,
+    gamma: float = 1.0,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """
+    Anchoring drift score for Drift-Trust-A.
+
+    r_evi = exp(-γ · |drift|)
+    r_t   = σ((r_evi − μ) / τ)
+
+    Low |drift| (stable token) → r_evi ≈ 1 → r_t high → amplify as anchor.
+    High |drift| (changing token) → r_evi ≈ 0 → r_t low → normal learning.
+
+    Args:
+        drift: Per-token signed drift from DriftBuffer, shape (B, T).
+        valid_mask: Boolean mask, shape (B, T).
+        gamma: Decay rate for |drift| → evidence conversion.
+        tau: Temperature for sigmoid normalization.
+
+    Returns:
+        r_t in [0, 1], shape (B, T).
+    """
+    r_evi = torch.exp(-gamma * drift.abs())
+
+    if valid_mask.any():
+        mu = r_evi[valid_mask].mean()
+    else:
+        mu = r_evi.mean()
+
+    r_t = torch.sigmoid((r_evi - mu) / tau)
     return r_t * valid_mask.float()
 
 
@@ -160,7 +196,7 @@ def compute_hardness_loss(
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Self-paced hardness weighting (hardness-only mode).
+    Self-paced hardness weighting (hardness-only ablation).
 
     w_t = w_min + (1 - w_min) · s_t
     L = Σ w_t · CE_t / N
@@ -187,7 +223,7 @@ def compute_hardness_loss(
     }
 
 
-def compute_drift_only_loss(
+def compute_drift_trust_s_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     drift: torch.Tensor,
@@ -198,17 +234,21 @@ def compute_drift_only_loss(
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Self-paced + drift regularization (main method).
+    Drift-Trust-S: Suppressive mapping.
+
+    Best for noisy alignment — suppresses unreliable tokens.
 
     w_t = w_min + (1 - w_min) · (β · s_t + (1 - β) · r_t)
     L = Σ w_t · CE_t / N
 
+    Weight range: [w_min, 1.0]
+
     Args:
         logits: Model output logits, shape (B, T, V).
         labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
-        drift: Per-token drift from DriftBuffer, shape (B, T).
+        drift: Per-token signed drift from DriftBuffer, shape (B, T).
         self_tau: Temperature for self-paced score.
-        drift_tau: Temperature for drift score.
+        drift_tau: Temperature for suppressive drift score.
         w_min: Minimum weight floor (prevents full suppression).
         beta: Balance between self-paced (β) and drift (1-β).
         num_items_in_batch: For sample-packing normalization.
@@ -228,7 +268,7 @@ def compute_drift_only_loss(
     shift_drift = drift[..., 1:].contiguous()
 
     s_t = compute_self_paced_score(active_logp, mask, self_tau)
-    r_t = compute_drift_score(shift_drift, mask, drift_tau)
+    r_t = compute_suppressive_drift_score(shift_drift, mask, drift_tau)
 
     w_t = w_min + (1.0 - w_min) * (beta * s_t + (1.0 - beta) * r_t)
 
@@ -244,45 +284,65 @@ def compute_drift_only_loss(
     }
 
 
-def compute_drift_legacy_loss(
+def compute_drift_trust_a_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     drift: torch.Tensor,
     gamma: float = 1.0,
     reliability_tau: float = 1.0,
-    kl_lambda: float = 4.0,
-    anchor_weight: float = 0.1,
+    anchor_base: float = 0.1,
+    anchor_lambda: float = 4.0,
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Legacy drift trust-region loss (ablation mode).
+    Drift-Trust-A: Anchoring mapping.
+
+    Best for clean domain specialization — amplifies knowledge anchors.
 
     r_evi = exp(-γ · |drift|)
     r_t   = σ((r_evi - μ) / τ)
-    L     = (anchor + λ · r_t) · CE_t
+    w_t   = w_0 + λ · r_t
+    L     = Σ w_t · CE_t / N
 
-    This is the original formulation from the Drift integration,
-    kept for ablation comparison.
+    Weight range: [w_0, w_0 + λ]  (default: [0.1, 4.1])
+
+    Args:
+        logits: Model output logits, shape (B, T, V).
+        labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
+        drift: Per-token signed drift from DriftBuffer, shape (B, T).
+        gamma: Decay rate for |drift| → evidence conversion.
+        reliability_tau: Temperature for anchoring score sigmoid.
+        anchor_base: Base weight w_0 (minimum contribution).
+        anchor_lambda: Amplification factor λ for reliable tokens.
+        num_items_in_batch: For sample-packing normalization.
+
+    Returns:
+        Tuple of (scalar loss, stats dict for logging).
     """
     shift_logits, shift_labels, mask, safe_labels = _shift_and_mask(logits, labels)
     ce_t = _per_token_ce(shift_logits, safe_labels)
 
     shift_drift = drift[..., 1:].contiguous()
-    r_evi = torch.exp(-gamma * shift_drift.abs())
+    r_t = compute_anchoring_drift_score(shift_drift, mask, gamma, reliability_tau)
 
-    mu = r_evi.mean()
-    r_t = torch.sigmoid((r_evi - mu) / reliability_tau)
+    # Anchoring: w_0 + λ · r_t
+    w_t = anchor_base + anchor_lambda * r_t
 
-    # Trust-region: (anchor + λ · r_t) · CE
-    effective_weight = anchor_weight + kl_lambda * r_t
-    weighted_ce = effective_weight * ce_t * mask.float()
+    weighted_ce = w_t * ce_t * mask.float()
     loss = _reduce(weighted_ce, mask, num_items_in_batch)
 
     return loss, {
         "ce_t": ce_t.detach(),
         "r_t": r_t.detach(),
-        "w_t": effective_weight.detach(),
+        "w_t": w_t.detach(),
     }
+
+
+# ── Legacy aliases ─────────────────────────────────────────────────────
+
+# Backward compatibility with old config files
+compute_drift_only_loss = compute_drift_trust_s_loss
+compute_drift_legacy_loss = compute_drift_trust_a_loss
 
 
 # ── Unified dispatch ───────────────────────────────────────────────────
@@ -300,26 +360,33 @@ def compute_rcca_loss(
     beta: float = 0.5,
     gamma: float = 1.0,
     reliability_tau: float = 1.0,
-    kl_lambda: float = 4.0,
-    anchor_weight: float = 0.1,
+    anchor_base: float = 0.1,
+    anchor_lambda: float = 4.0,
     num_items_in_batch: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
-    Unified loss dispatch for all RCCA-TR modes.
+    Unified loss dispatch for all Drift-Trust modes.
 
     Args:
-        mode: One of {"ce", "hardness", "drift_only", "drift"}.
+        mode: One of {"ce", "hardness", "drift_trust_s", "drift_trust_a"}.
+              Legacy aliases "drift_only" and "drift" are also accepted.
         logits: Model output logits, shape (B, T, V).
         labels: Ground-truth labels, shape (B, T).
-        drift: Per-token drift from DriftBuffer (required for drift modes).
+        drift: Per-token signed drift from DriftBuffer (required for drift modes).
         **kwargs: Mode-specific hyperparameters.
 
     Returns:
         Tuple of (scalar loss, stats dict).
 
     Raises:
-        ValueError: If mode is unknown.
+        ValueError: If mode is unknown or drift is missing.
     """
+    # Resolve legacy aliases
+    if mode == "drift_only":
+        mode = "drift_trust_s"
+    elif mode == "drift":
+        mode = "drift_trust_a"
+
     if mode == "ce":
         return compute_ce_loss(logits, labels, num_items_in_batch)
 
@@ -328,24 +395,24 @@ def compute_rcca_loss(
             logits, labels, self_tau, w_min, num_items_in_batch,
         )
 
-    elif mode == "drift_only":
+    elif mode == "drift_trust_s":
         if drift is None:
-            raise ValueError("drift_only mode requires drift tensor from DriftBuffer")
-        return compute_drift_only_loss(
+            raise ValueError("drift_trust_s mode requires drift tensor from DriftBuffer")
+        return compute_drift_trust_s_loss(
             logits, labels, drift,
             self_tau, drift_tau, w_min, beta, num_items_in_batch,
         )
 
-    elif mode == "drift":
+    elif mode == "drift_trust_a":
         if drift is None:
-            raise ValueError("drift mode requires drift tensor from DriftBuffer")
-        return compute_drift_legacy_loss(
+            raise ValueError("drift_trust_a mode requires drift tensor from DriftBuffer")
+        return compute_drift_trust_a_loss(
             logits, labels, drift,
-            gamma, reliability_tau, kl_lambda, anchor_weight, num_items_in_batch,
+            gamma, reliability_tau, anchor_base, anchor_lambda, num_items_in_batch,
         )
 
     else:
         raise ValueError(
             f"Unknown rcca_tr_mode: {mode!r}. "
-            f"Expected one of: ce, hardness, drift_only, drift"
+            f"Expected one of: ce, hardness, drift_trust_s, drift_trust_a"
         )

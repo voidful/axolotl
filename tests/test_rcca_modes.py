@@ -1,11 +1,13 @@
 """
-Regression tests for RCCA-TR integration.
+Regression tests for Drift-Trust integration.
 
 Tests:
   1. All four modes produce a valid scalar loss.
-  2. drift_only weights are bounded in [w_min, 1.0].
-  3. DriftBuffer running mean updates monotonically with consistent input.
-  4. Unified dispatch raises on unknown mode.
+  2. Drift-Trust-S weights are bounded in [w_min, 1.0].
+  3. Drift-Trust-A weights are bounded in [anchor_base, anchor_base + anchor_lambda].
+  4. DriftBuffer running mean updates monotonically with consistent input.
+  5. Score functions produce values in [0, 1].
+  6. Unified dispatch raises on unknown mode.
 """
 
 import pytest
@@ -14,12 +16,16 @@ import torch
 from axolotl.integrations.rcca_tr.drift import DriftBuffer
 from axolotl.integrations.rcca_tr.loss import (
     compute_ce_loss,
-    compute_drift_only_loss,
-    compute_drift_legacy_loss,
+    compute_drift_trust_s_loss,
+    compute_drift_trust_a_loss,
     compute_hardness_loss,
     compute_rcca_loss,
     compute_self_paced_score,
-    compute_drift_score,
+    compute_suppressive_drift_score,
+    compute_anchoring_drift_score,
+    # Legacy aliases
+    compute_drift_only_loss,
+    compute_drift_legacy_loss,
 )
 
 
@@ -64,9 +70,9 @@ class TestAllModesForward:
         assert torch.isfinite(loss)
         assert "s_t" in stats and "w_t" in stats
 
-    def test_drift_only_mode(self, dummy_data, dummy_drift):
+    def test_drift_trust_s_mode(self, dummy_data, dummy_drift):
         logits, labels = dummy_data
-        loss, stats = compute_drift_only_loss(
+        loss, stats = compute_drift_trust_s_loss(
             logits, labels, dummy_drift,
             self_tau=1.0, drift_tau=1.0, w_min=0.05, beta=0.5,
         )
@@ -74,11 +80,11 @@ class TestAllModesForward:
         assert torch.isfinite(loss)
         assert "s_t" in stats and "r_t" in stats and "w_t" in stats
 
-    def test_drift_legacy_mode(self, dummy_data, dummy_drift):
+    def test_drift_trust_a_mode(self, dummy_data, dummy_drift):
         logits, labels = dummy_data
-        loss, stats = compute_drift_legacy_loss(
+        loss, stats = compute_drift_trust_a_loss(
             logits, labels, dummy_drift,
-            gamma=1.0, reliability_tau=1.0, kl_lambda=4.0, anchor_weight=0.1,
+            gamma=1.0, reliability_tau=1.0, anchor_base=0.1, anchor_lambda=4.0,
         )
         assert loss.dim() == 0
         assert torch.isfinite(loss)
@@ -86,23 +92,33 @@ class TestAllModesForward:
 
     def test_unified_dispatch_all_modes(self, dummy_data, dummy_drift):
         logits, labels = dummy_data
-        for mode in ("ce", "hardness", "drift_only", "drift"):
+        for mode in ("ce", "hardness", "drift_trust_s", "drift_trust_a"):
             loss, stats = compute_rcca_loss(
                 mode=mode, logits=logits, labels=labels, drift=dummy_drift,
             )
             assert loss.dim() == 0, f"{mode} did not return scalar"
             assert torch.isfinite(loss), f"{mode} returned non-finite loss"
 
+    def test_legacy_aliases_dispatch(self, dummy_data, dummy_drift):
+        """Legacy mode names 'drift_only' and 'drift' still work."""
+        logits, labels = dummy_data
+        for mode in ("drift_only", "drift"):
+            loss, stats = compute_rcca_loss(
+                mode=mode, logits=logits, labels=labels, drift=dummy_drift,
+            )
+            assert loss.dim() == 0, f"Legacy alias {mode} did not return scalar"
+            assert torch.isfinite(loss), f"Legacy alias {mode} returned non-finite loss"
 
-# ── Test 2: Weight bounds ─────────────────────────────────────────────
 
-class TestWeightBounds:
-    """drift_only weights must be in [w_min, 1.0]."""
+# ── Test 2: Drift-Trust-S weight bounds ───────────────────────────────
+
+class TestDriftTrustSWeightBounds:
+    """Drift-Trust-S weights must be in [w_min, 1.0] (suppressive)."""
 
     @pytest.mark.parametrize("w_min", [0.0, 0.05, 0.1, 0.5])
     def test_w_range(self, dummy_data, dummy_drift, w_min):
         logits, labels = dummy_data
-        _, stats = compute_drift_only_loss(
+        _, stats = compute_drift_trust_s_loss(
             logits, labels, dummy_drift, w_min=w_min,
         )
         w_t = stats["w_t"]
@@ -114,7 +130,46 @@ class TestWeightBounds:
         assert w_valid.max() <= 1.0 + 1e-6, f"w_t above 1.0: {w_valid.max()}"
 
 
-# ── Test 3: DriftBuffer update monotonicity ───────────────────────────
+# ── Test 3: Drift-Trust-A weight bounds ───────────────────────────────
+
+class TestDriftTrustAWeightBounds:
+    """Drift-Trust-A weights must be in [anchor_base, anchor_base + anchor_lambda] (anchoring)."""
+
+    @pytest.mark.parametrize(
+        "anchor_base,anchor_lambda",
+        [(0.1, 4.0), (0.0, 2.0), (0.5, 1.0)],
+    )
+    def test_w_range(self, dummy_data, dummy_drift, anchor_base, anchor_lambda):
+        logits, labels = dummy_data
+        _, stats = compute_drift_trust_a_loss(
+            logits, labels, dummy_drift,
+            anchor_base=anchor_base, anchor_lambda=anchor_lambda,
+        )
+        w_t = stats["w_t"]
+        mask = labels[..., 1:] != -100
+
+        w_valid = w_t[mask]
+        assert w_valid.min() >= anchor_base - 1e-6, (
+            f"w_t below anchor_base ({anchor_base}): {w_valid.min()}"
+        )
+        assert w_valid.max() <= anchor_base + anchor_lambda + 1e-6, (
+            f"w_t above anchor_base + anchor_lambda ({anchor_base + anchor_lambda}): {w_valid.max()}"
+        )
+
+    def test_amplification_exceeds_one(self, dummy_data, dummy_drift):
+        """Drift-Trust-A should produce weights > 1.0 (amplification)."""
+        logits, labels = dummy_data
+        _, stats = compute_drift_trust_a_loss(
+            logits, labels, dummy_drift,
+            anchor_base=0.1, anchor_lambda=4.0,
+        )
+        w_t = stats["w_t"]
+        mask = labels[..., 1:] != -100
+        w_valid = w_t[mask]
+        assert w_valid.max() > 1.0, "Drift-Trust-A should amplify some tokens above 1.0"
+
+
+# ── Test 4: DriftBuffer update monotonicity ───────────────────────────
 
 class TestDriftBuffer:
     """DriftBuffer running mean moves toward the batch mean."""
@@ -179,7 +234,7 @@ class TestDriftBuffer:
         assert (drift[~mask] == 0).all(), "Masked positions must have zero drift"
 
 
-# ── Test 4: Score functions ───────────────────────────────────────────
+# ── Test 5: Score functions ───────────────────────────────────────────
 
 class TestScoreFunctions:
     def test_self_paced_range(self):
@@ -189,15 +244,34 @@ class TestScoreFunctions:
         assert s_t.min() >= 0.0
         assert s_t.max() <= 1.0
 
-    def test_drift_score_range(self):
+    def test_suppressive_drift_score_range(self):
         drift = torch.randn(2, 10)
         mask = torch.ones(2, 10, dtype=torch.bool)
-        r_t = compute_drift_score(drift, mask, tau=1.0)
+        r_t = compute_suppressive_drift_score(drift, mask, tau=1.0)
         assert r_t.min() >= 0.0
         assert r_t.max() <= 1.0
 
+    def test_anchoring_drift_score_range(self):
+        drift = torch.randn(2, 10)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        r_t = compute_anchoring_drift_score(drift, mask, gamma=1.0, tau=1.0)
+        assert r_t.min() >= 0.0
+        assert r_t.max() <= 1.0
 
-# ── Test 5: Error handling ────────────────────────────────────────────
+    def test_suppressive_vs_anchoring_differ(self):
+        """Suppressive and anchoring scores should differ for same drift input."""
+        torch.manual_seed(42)
+        drift = torch.randn(2, 10) * 2.0
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        r_sup = compute_suppressive_drift_score(drift, mask, tau=1.0)
+        r_anc = compute_anchoring_drift_score(drift, mask, gamma=1.0, tau=1.0)
+        # They should not be identical
+        assert not torch.allclose(r_sup, r_anc), (
+            "Suppressive and anchoring scores should differ"
+        )
+
+
+# ── Test 6: Error handling ────────────────────────────────────────────
 
 class TestErrorHandling:
     def test_unknown_mode_raises(self, dummy_data):
@@ -205,7 +279,12 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="Unknown rcca_tr_mode"):
             compute_rcca_loss(mode="banana", logits=logits, labels=labels)
 
-    def test_drift_only_without_drift_raises(self, dummy_data):
+    def test_drift_trust_s_without_drift_raises(self, dummy_data):
         logits, labels = dummy_data
         with pytest.raises(ValueError, match="requires drift tensor"):
-            compute_rcca_loss(mode="drift_only", logits=logits, labels=labels, drift=None)
+            compute_rcca_loss(mode="drift_trust_s", logits=logits, labels=labels, drift=None)
+
+    def test_drift_trust_a_without_drift_raises(self, dummy_data):
+        logits, labels = dummy_data
+        with pytest.raises(ValueError, match="requires drift tensor"):
+            compute_rcca_loss(mode="drift_trust_a", logits=logits, labels=labels, drift=None)

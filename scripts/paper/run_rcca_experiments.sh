@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# RCCA-TR NeurIPS 2026 — Full Paper Experiments
+# Drift-Trust NeurIPS 2026 — Full Paper Experiments
 # ============================================================
 #
 # Usage:
@@ -28,11 +28,11 @@ RESULTS_DIR="${PROJECT_DIR}/results/paper"
 EVAL_SCRIPT="${PAPER_SCRIPTS}/eval_benchmarks.sh"
 
 PHASE="${1:-all}"
-MODES=("ce" "hardness" "drift_only" "drift")
-SEEDS=(42)  # Extend to (42 123 456) for 3-seed runs
+MODES=("ce" "hardness" "drift_trust_s" "drift_trust_a")
+SEEDS=(42 123 456)  # Robustness: 3 seeds for error bars
 
 echo "============================================"
-echo "  RCCA-TR NeurIPS 2026"
+echo "  Drift-Trust NeurIPS 2026"
 echo "  Full Paper Experiments"
 echo "  Phase: ${PHASE}"
 echo "  Modes: ${MODES[*]}"
@@ -97,7 +97,7 @@ generate_config() {
     local seed="${6:-42}"
 
     cat > "${config_path}" << YAML
-# Auto-generated RCCA-TR config
+# Auto-generated Drift-Trust config
 # Mode: ${mode} | Seed: ${seed}
 base_model: Qwen/Qwen3.5-4B
 low_cpu_mem_usage: true
@@ -111,13 +111,18 @@ liger_glu_activation: true
 
 rcca_tr_trainer: true
 rcca_tr_mode: ${mode}
+rcca_tr_ema_decay: 0.999
+
+# Drift-Trust-S (suppressive) params
 rcca_tr_self_tau: 1.0
 rcca_tr_drift_tau: 1.0
 rcca_tr_w_min: 0.05
 rcca_tr_beta: 0.5
-rcca_tr_ema_decay: 0.999
-rcca_tr_kl_lambda: 4.0
-rcca_tr_anchor_weight: 0.1
+
+# Drift-Trust-A (anchoring) params
+rcca_tr_drift_gamma: 1.0
+rcca_tr_anchor_base: 0.1
+rcca_tr_anchor_lambda: 4.0
 rcca_tr_reliability_tau: 1.0
 
 datasets:
@@ -157,7 +162,7 @@ output_dir: ${output_dir}
 
 logging_steps: 1
 report_to: wandb
-wandb_project: rcca-tr-neurips2026
+wandb_project: drift-trust-neurips2026
 wandb_run_name: ${mode}-$(basename "${dataset_path}" .jsonl)-s${seed}
 YAML
     echo "  Generated: ${config_path}"
@@ -180,15 +185,22 @@ phase_data() {
         echo "[data] medical_flashcards_10k.jsonl — exists"
     fi
 
-    # Noisy UltraFeedback (25% noise — main noise level)
-    if [ ! -f "${DATA_DIR}/ultrafeedback_noisy_25pct_10k.jsonl" ]; then
-        echo "[data] Creating noisy UltraFeedback (25%)..."
-        python3 "${PAPER_SCRIPTS}/create_noisy_ultrafeedback.py" \
-            --output_dir "${DATA_DIR}" --noise_fraction 0.25 \
-            --num_samples 10000 --seed 42
-    else
-        echo "[data] ultrafeedback_noisy_25pct_10k.jsonl — exists"
-    fi
+    # Noise Sweep datasets
+    local noise_fracs=("0:0.0" "10:0.1" "25:0.25" "50:0.5" "75:0.75")
+    for item in "${noise_fracs[@]}"; do
+        pct="${item%%:*}"
+        frac="${item##*:}"
+        ds_name="ultrafeedback_noisy_${pct}pct_10k.jsonl"
+        
+        if [ ! -f "${DATA_DIR}/${ds_name}" ]; then
+            echo "[data] Creating noisy UltraFeedback (${pct}%)..."
+            python3 "${PAPER_SCRIPTS}/create_noisy_ultrafeedback.py" \
+                --output_dir "${DATA_DIR}" --noise_fraction ${frac} \
+                --num_samples 10000 --seed 42
+        else
+            echo "[data] ${ds_name} — exists"
+        fi
+    done
 
     echo "=== Data ready ==="
 }
@@ -225,14 +237,12 @@ phase_train_math() {
     echo ""
     echo "=== TRAIN: Math (Battle B) ==="
 
-    # Math uses existing NuminaMath-CoT configs — just need the RCCA versions
-    # For now, use the same dataset path as the existing math configs
     local dataset
     if [ -f "${DATA_DIR}/numinamath_cot_10k.jsonl" ]; then
         dataset="${DATA_DIR}/numinamath_cot_10k.jsonl"
     else
         echo "[train] Math dataset not found at ${DATA_DIR}/numinamath_cot_10k.jsonl"
-        echo "[train] Using existing ce-math-4b / drift-math-4b checkpoints for eval only"
+        echo "[train] Using existing checkpoints for eval only"
         return 0
     fi
 
@@ -254,24 +264,34 @@ phase_train_math() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-# Phase: Training — Noisy Alignment (Battle A)
+# Phase: Training — Noisy Alignment (Battle A & Sweep)
 # ══════════════════════════════════════════════════════════════════
 phase_train_noise() {
     echo ""
-    echo "=== TRAIN: Noisy Alignment (Battle A) ==="
+    echo "=== TRAIN: Noisy Alignment Sweep ==="
 
-    local dataset="${DATA_DIR}/ultrafeedback_noisy_25pct_10k.jsonl"
     mkdir -p "${CONFIG_DIR}"
 
-    for mode in "${MODES[@]}"; do
-        for seed in "${SEEDS[@]}"; do
-            local run="rcca-${mode}-noise25-4b-s${seed}"
-            local config="${CONFIG_DIR}/${mode}_noise25_s${seed}.yaml"
-            local output="./outputs/paper/${run}"
-            local prepared="./prepared_data/paper/rcca_${mode}_noise25_4b_s${seed}"
+    for pct in 0 10 25 50 75; do
+        local dataset="${DATA_DIR}/ultrafeedback_noisy_${pct}pct_10k.jsonl"
+        
+        # We only run all 4 modes for the primary 25% noise setting
+        # For the sweep, we only need CE, Drift-Trust-S, and Drift-Trust-A
+        local current_modes=("ce" "drift_trust_s" "drift_trust_a")
+        if [ "$pct" == "25" ]; then
+            current_modes=("${MODES[@]}")
+        fi
 
-            generate_config "${mode}" "${dataset}" "${output}" "${config}" "${prepared}" "${seed}"
-            train_if_needed "${config}" "${output}" "${mode} noise25 s${seed}"
+        for mode in "${current_modes[@]}"; do
+            for seed in "${SEEDS[@]}"; do
+                local run="rcca-${mode}-noise${pct}-4b-s${seed}"
+                local config="${CONFIG_DIR}/${mode}_noise${pct}_s${seed}.yaml"
+                local output="./outputs/paper/${run}"
+                local prepared="./prepared_data/paper/rcca_${mode}_noise${pct}_4b_s${seed}"
+
+                generate_config "${mode}" "${dataset}" "${output}" "${config}" "${prepared}" "${seed}"
+                train_if_needed "${config}" "${output}" "${mode} noise${pct} s${seed}"
+            done
         done
     done
 
@@ -286,11 +306,11 @@ phase_eval() {
     echo "=== EVALUATION ==="
     mkdir -p "${RESULTS_DIR}/benchmarks"
 
-    # Base model (once)
+    # Base model
     eval_if_needed "Qwen/Qwen3.5-4B" "qwen35_4b_base" "Base model"
 
-    # All RCCA runs
-    for regime in medical math noise25; do
+    # Medical & Math evals
+    for regime in medical math; do
         for mode in "${MODES[@]}"; do
             for seed in "${SEEDS[@]}"; do
                 local run="rcca-${mode}-${regime}-4b-s${seed}"
@@ -300,7 +320,21 @@ phase_eval() {
         done
     done
 
-    # Legacy checkpoints (from previous experiments)
+    # Noise sweep evals
+    for pct in 0 10 25 50 75; do
+        local current_modes=("ce" "drift_trust_s" "drift_trust_a")
+        if [ "$pct" == "25" ]; then current_modes=("${MODES[@]}"); fi
+        
+        for mode in "${current_modes[@]}"; do
+            for seed in "${SEEDS[@]}"; do
+                local run="rcca-${mode}-noise${pct}-4b-s${seed}"
+                local eval_name="rcca_${mode}_noise${pct}_s${seed}"
+                eval_if_needed "./outputs/paper/${run}" "${eval_name}" "${mode} noise${pct} s${seed}"
+            done
+        done
+    done
+
+    # Legacy checkpoints (from previous iterations, for backward compatibility)
     eval_if_needed "./outputs/paper/ce-math-4b" "ce_math_4b" "CE-Math (legacy)"
     eval_if_needed "./outputs/paper/drift-math-4b" "drift_math_4b" "Drift-Math (legacy)"
     eval_if_needed "./outputs/paper/ce-medical-4b" "ce_medical_4b" "CE-Medical (legacy)"
@@ -343,6 +377,7 @@ phase_summary() {
 
     python3 << 'PYEOF'
 import json, os
+import statistics
 
 results_dir = os.environ.get("RESULTS_DIR", "./results/paper")
 bench_dir = os.path.join(results_dir, "benchmarks")
@@ -373,79 +408,130 @@ def get_mmlu(d):
 def get_medqa(d):
     return d.get("medqa_4options/acc,none") or d.get("medqa/acc,none")
 
-def fmt(v):
-    return f"{v*100:.2f}%" if v is not None else "---"
+def load_all_seeds(prefix, metric_getter):
+    vals = []
+    # Try all requested seeds
+    for seed in [42, 123, 456]:
+        d = load_metrics(f"{prefix}_s{seed}")
+        val = metric_getter(d)
+        if val is not None:
+            vals.append(val)
+    
+    # Fallbacks for legacy/interrupted runs
+    if not vals:
+        # Fallback 1: Legacy name structure mapping (e.g. drift_only -> drift_trust_s)
+        legacy_prefix = prefix.replace("drift_trust_s", "drift_only").replace("drift_trust_a", "drift")
+        if legacy_prefix != prefix:
+            for seed in [42, 123, 456]:
+                d = load_metrics(f"{legacy_prefix}_s{seed}")
+                val = metric_getter(d)
+                if val is not None: vals.append(val)
+                
+    if not vals:
+        # Fallback 2: Old single-seed manual names
+        fallback_name = prefix.replace("rcca_", "").replace("_medical", "-medical-4b").replace("_math", "-math-4b").replace("_", "-")
+        d = load_metrics(fallback_name)
+        val = metric_getter(d)
+        if val is not None: vals.append(val)
 
-def delta(v, base):
-    if v is None or base is None: return "---"
-    return f"{(v-base)*100:+.2f}pp"
+    if not vals: return None, None
+    if len(vals) == 1: return vals[0], 0.0
+    return statistics.mean(vals), statistics.stdev(vals)
+
+def fmt(mean, std):
+    if mean is None: return "---"
+    if std == 0.0: return f"{mean*100:.2f}%"
+    return f"{mean*100:.2f}±{std*100:.2f}"
+
+def delta(mean, base):
+    if mean is None or base is None: return "---"
+    return f"{(mean-base)*100:+.2f}pp"
 
 print("\n" + "=" * 80)
-print("  RCCA-TR FULL PAPER RESULTS")
+print("  DRIFT-TRUST FULL PAPER RESULTS (MEAN ± STD)")
 print("=" * 80)
 
-base = load_metrics("qwen35_4b_base")
-base_mmlu = get_mmlu(base)
-print(f"\nBase Model MMLU-Pro: {fmt(base_mmlu)}")
+base_d = load_metrics("qwen35_4b_base")
+base_mmlu = get_mmlu(base_d)
+print(f"\nBase Model MMLU-Pro: {fmt(base_mmlu, 0.0)}")
+
+# Map mode names to paper labels
+mode_labels = {
+    "ce": "CE",
+    "hardness": "Hardness",
+    "drift_trust_s": "Drift-Trust-S",
+    "drift_trust_a": "Drift-Trust-A",
+}
 
 # ── Medical (Battle C) ──
 print("\n" + "-" * 70)
 print("  Battle C: Medical SFT — Catastrophic Forgetting")
 print("-" * 70)
-print(f"{'Mode':<18} {'MMLU-Pro':>10} {'MedQA':>10} {'Δ MMLU':>12}")
-print("-" * 55)
-print(f"{'Base (no SFT)':<18} {fmt(base_mmlu):>10} {'---':>10} {'---':>12}")
+print(f"{'Mode':<18} {'MMLU-Pro':>15} {'MedQA':>15} {'Δ MMLU':>12}")
+print("-" * 65)
+print(f"{'Base (no SFT)':<18} {fmt(base_mmlu, 0.0):>15} {'---':>15} {'---':>12}")
 
-for mode in ["ce", "hardness", "drift_only", "drift"]:
-    d = load_metrics(f"rcca_{mode}_medical_s42")
-    if not d:
-        d = load_metrics(f"rcca_{mode}_medical_4b")  # static config fallback
-    mmlu = get_mmlu(d)
-    medqa = get_medqa(d)
-    marker = " ★" if mode == "drift_only" else ""
-    print(f"{mode + marker:<18} {fmt(mmlu):>10} {fmt(medqa):>10} {delta(mmlu, base_mmlu):>12}")
+for mode in ["ce", "hardness", "drift_trust_s", "drift_trust_a"]:
+    mmlu_mean, mmlu_std = load_all_seeds(f"rcca_{mode}_medical", get_mmlu)
+    medqa_mean, medqa_std = load_all_seeds(f"rcca_{mode}_medical", get_medqa)
+    
+    label = mode_labels.get(mode, mode)
+    if mode == "drift_trust_a": label += " ★"  # Best for medical
+    print(f"{label:<18} {fmt(mmlu_mean, mmlu_std):>15} {fmt(medqa_mean, medqa_std):>15} {delta(mmlu_mean, base_mmlu):>12}")
 
-# Also show legacy results
-for name, label in [("ce_medical_4b","CE (legacy)"),("drift_medical_4b","Drift (legacy)")]:
-    d = load_metrics(name)
-    if d:
-        mmlu = get_mmlu(d)
-        medqa = get_medqa(d)
-        print(f"{label:<18} {fmt(mmlu):>10} {fmt(medqa):>10} {delta(mmlu, base_mmlu):>12}")
 
 # ── Math (Battle B) ──
 print("\n" + "-" * 70)
 print("  Battle B: Math SFT — Reasoning Trade-off")
 print("-" * 70)
-print(f"{'Mode':<18} {'MMLU-Pro':>10} {'Δ MMLU':>12}")
-print("-" * 45)
-print(f"{'Base (no SFT)':<18} {fmt(base_mmlu):>10} {'---':>12}")
+print(f"{'Mode':<18} {'MMLU-Pro':>15} {'Δ MMLU':>12}")
+print("-" * 50)
+print(f"{'Base (no SFT)':<18} {fmt(base_mmlu, 0.0):>15} {'---':>12}")
 
-for mode in ["ce", "hardness", "drift_only", "drift"]:
-    d = load_metrics(f"rcca_{mode}_math_s42")
-    mmlu = get_mmlu(d)
-    if mmlu:
-        print(f"{mode:<18} {fmt(mmlu):>10} {delta(mmlu, base_mmlu):>12}")
+for mode in ["ce", "hardness", "drift_trust_s", "drift_trust_a"]:
+    mmlu_mean, mmlu_std = load_all_seeds(f"rcca_{mode}_math", get_mmlu)
+    label = mode_labels.get(mode, mode)
+    if mmlu_mean:
+        print(f"{label:<18} {fmt(mmlu_mean, mmlu_std):>15} {delta(mmlu_mean, base_mmlu):>12}")
 
-for name, label in [("ce_math_4b","CE-Math (legacy)"),("drift_math_4b","Drift-Math (legacy)")]:
-    d = load_metrics(name)
-    if d:
-        mmlu = get_mmlu(d)
-        print(f"{label:<18} {fmt(mmlu):>10} {delta(mmlu, base_mmlu):>12}")
 
 # ── Noise (Battle A) ──
 print("\n" + "-" * 70)
 print("  Battle A: Noisy Alignment (25% noise)")
 print("-" * 70)
-print(f"{'Mode':<18} {'MMLU-Pro':>10} {'Δ MMLU':>12}")
-print("-" * 45)
-print(f"{'Base (no SFT)':<18} {fmt(base_mmlu):>10} {'---':>12}")
+print(f"{'Mode':<18} {'MMLU-Pro':>15} {'Δ MMLU':>12}")
+print("-" * 50)
+print(f"{'Base (no SFT)':<18} {fmt(base_mmlu, 0.0):>15} {'---':>12}")
 
-for mode in ["ce", "hardness", "drift_only", "drift"]:
-    d = load_metrics(f"rcca_{mode}_noise25_s42")
-    mmlu = get_mmlu(d)
-    if mmlu:
-        print(f"{mode:<18} {fmt(mmlu):>10} {delta(mmlu, base_mmlu):>12}")
+for mode in ["ce", "hardness", "drift_trust_s", "drift_trust_a"]:
+    mmlu_mean, mmlu_std = load_all_seeds(f"rcca_{mode}_noise25", get_mmlu)
+    label = mode_labels.get(mode, mode)
+    if mode == "drift_trust_s": label += " ★"  # Best for noisy
+    if mmlu_mean:
+        print(f"{label:<18} {fmt(mmlu_mean, mmlu_std):>15} {delta(mmlu_mean, base_mmlu):>12}")
+
+
+# ── Noise Sweep ──
+print("\n" + "-" * 85)
+print("  Noise Level Sweep (MMLU-Pro)")
+print("-" * 85)
+print(f"{'Mode':<18} {'0%':>12} {'10%':>12} {'25%':>12} {'50%':>12} {'75%':>12}")
+print("-" * 85)
+
+for mode in ["ce", "drift_trust_s", "drift_trust_a"]:
+    label = mode_labels.get(mode, mode)
+    row = [label.ljust(18)]
+    for pct in [0, 10, 25, 50, 75]:
+        m, s = load_all_seeds(f"rcca_{mode}_noise{pct}", get_mmlu)
+        if m is not None:
+            # Drop the std component in the sweep table for clean viewing if needed, 
+            # but we print it since we have the space
+            val_str = fmt(m, s)
+            row.append(val_str.rjust(12))
+        else:
+            row.append("---".rjust(12))
+    print(" ".join(row))
+
 
 print("\n" + "=" * 80)
 
@@ -514,9 +600,9 @@ case "${PHASE}" in
         echo ""
         echo "Phases:"
         echo "  all      — Full pipeline: data → train → eval → summary"
-        echo "  train    — Train all 4 modes × 3 regimes"
+        echo "  train    — Train all modes × regimes × seeds"
         echo "  eval     — Evaluate all checkpoints (MMLU-Pro + MedQA)"
-        echo "  summary  — Aggregate and print results table"
+        echo "  summary  — Aggregate and print mean±std results table"
         echo "  medical  — Medical only (train + eval + summary)"
         echo "  math     — Math only (train + eval + summary)"
         echo "  noise    — Noisy alignment only (train + eval + summary)"

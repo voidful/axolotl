@@ -13,13 +13,15 @@
 # limitations under the License.
 
 """
-Plugin args for RCCA-TR (Reliability-Calibrated, Curriculum-Aware Trust Region).
+Plugin args for Drift-Trust.
 
-Four explicit modes:
-  - ce:         Standard cross-entropy (baseline).
-  - hardness:   Self-paced hardness weighting only.
-  - drift_only: Self-paced + drift regularization (main method).
-  - drift:      Full drift + hardness + anchor (ablation).
+A token-level regularization family built on a shared drift signal
+and two transfer functions:
+
+  - ce:            Standard cross-entropy (baseline).
+  - hardness:      Self-paced hardness weighting only (ablation).
+  - drift_trust_s: Suppressive mapping — best for noisy alignment.
+  - drift_trust_a: Anchoring mapping — best for clean domain specialization.
 """
 
 from __future__ import annotations
@@ -32,38 +34,32 @@ from pydantic import BaseModel
 
 class RCCATRArgs(BaseModel):
     """
-    Input args for RCCA-TR fine-tuning.
+    Input args for Drift-Trust fine-tuning.
     """
 
     rcca_tr_trainer: Optional[bool] = None
 
     # --- Method mode ---
-    rcca_tr_mode: Optional[Literal["ce", "hardness", "drift_only", "drift"]] = (
-        "drift_only"
-    )
+    rcca_tr_mode: Optional[Literal[
+        "ce", "hardness", "drift_trust_s", "drift_trust_a",
+        # Legacy aliases (backward compat with existing configs)
+        "drift_only", "drift",
+    ]] = "drift_trust_s"
 
-    # --- Self-paced (hardness) hyperparameters ---
-    rcca_tr_tau_p: Optional[float] = 2.0   # temperature for hardness sigmoid
-    rcca_tr_T_p: Optional[float] = 1.0     # hardness threshold (unused in drift_only)
+    # --- Shared drift buffer ---
+    rcca_tr_ema_decay: Optional[float] = 0.999  # EMA decay for running mean
 
-    # --- Drift hyperparameters ---
-    rcca_tr_tau_delta: Optional[float] = 0.8  # temperature for drift score sigmoid
-    rcca_tr_T_delta: Optional[float] = 1.0    # drift threshold (unused in drift_only)
-
-    # --- Weighting ---
-    rcca_tr_w_min: Optional[float] = 0.05  # minimum token weight floor
-    rcca_tr_beta: Optional[float] = 0.5    # balance: β·s_t + (1-β)·r_t
-
-    # --- Drift buffer ---
+    # --- Drift-Trust-S (suppressive) hyperparameters ---
     rcca_tr_self_tau: Optional[float] = 1.0    # self-paced score temperature
     rcca_tr_drift_tau: Optional[float] = 1.0   # drift score temperature
-    rcca_tr_drift_gamma: Optional[float] = 1.0 # drift scaling (legacy compat)
-    rcca_tr_ema_decay: Optional[float] = 0.999 # EMA decay for running mean
+    rcca_tr_w_min: Optional[float] = 0.05      # minimum token weight floor
+    rcca_tr_beta: Optional[float] = 0.5        # balance: β·s_t + (1-β)·r_t
 
-    # --- Legacy drift mode (ablation) ---
-    rcca_tr_kl_lambda: Optional[float] = 4.0
-    rcca_tr_anchor_weight: Optional[float] = 0.1
-    rcca_tr_reliability_tau: Optional[float] = 1.0
+    # --- Drift-Trust-A (anchoring) hyperparameters ---
+    rcca_tr_drift_gamma: Optional[float] = 1.0   # |drift| decay rate
+    rcca_tr_anchor_base: Optional[float] = 0.1    # base weight w_0
+    rcca_tr_anchor_lambda: Optional[float] = 4.0  # amplification factor λ
+    rcca_tr_reliability_tau: Optional[float] = 1.0 # sigmoid temperature for r_t
 
 
 @dataclass
@@ -72,17 +68,13 @@ class RCCATRTrainingArgsMixin:
     Additional training args injected into HuggingFace TrainingArguments.
     """
 
-    rcca_tr_mode: Optional[str] = "drift_only"
-    rcca_tr_tau_p: Optional[float] = 2.0
-    rcca_tr_T_p: Optional[float] = 1.0
-    rcca_tr_tau_delta: Optional[float] = 0.8
-    rcca_tr_T_delta: Optional[float] = 1.0
-    rcca_tr_w_min: Optional[float] = 0.05
-    rcca_tr_beta: Optional[float] = 0.5
+    rcca_tr_mode: Optional[str] = "drift_trust_s"
+    rcca_tr_ema_decay: Optional[float] = 0.999
     rcca_tr_self_tau: Optional[float] = 1.0
     rcca_tr_drift_tau: Optional[float] = 1.0
+    rcca_tr_w_min: Optional[float] = 0.05
+    rcca_tr_beta: Optional[float] = 0.5
     rcca_tr_drift_gamma: Optional[float] = 1.0
-    rcca_tr_ema_decay: Optional[float] = 0.999
-    rcca_tr_kl_lambda: Optional[float] = 4.0
-    rcca_tr_anchor_weight: Optional[float] = 0.1
+    rcca_tr_anchor_base: Optional[float] = 0.1
+    rcca_tr_anchor_lambda: Optional[float] = 4.0
     rcca_tr_reliability_tau: Optional[float] = 1.0

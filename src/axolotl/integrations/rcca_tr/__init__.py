@@ -13,24 +13,28 @@
 # limitations under the License.
 
 """
-Plugin init for RCCA-TR (Reliability-Calibrated, Curriculum-Aware Trust Region).
+Plugin init for Drift-Trust.
 
-Token-level dense weighting for knowledge-preserving post-training.
+A token-level regularization family built on a shared drift signal
+and two transfer functions for post-training knowledge preservation.
 
 Four modes (controlled by ``rcca_tr_mode``):
-  - ce:         Standard cross-entropy baseline.
-  - hardness:   Self-paced hardness weighting only.
-  - drift_only: Self-paced + drift regularization (MAIN METHOD).
-  - drift:      Legacy trust-region formulation (ablation).
 
-Main method formula (drift_only):
+  ce            — Standard cross-entropy baseline.
+  hardness      — Self-paced hardness weighting only (ablation).
+  drift_trust_s — Suppressive mapping (best for noisy alignment).
+  drift_trust_a — Anchoring mapping (best for clean domain specialization).
+
+Shared drift signal:
+  d_t = log p_θ(y_t) − running_mean     [temporal drift]
+
+Drift-Trust-S (suppressive):
   w_t = w_min + (1 - w_min) · (β · s_t + (1 - β) · r_t)
-  L   = Σ w_t · CE_t / N
+  w_t ∈ [0.05, 1.0]
 
-Where:
-  s_t = σ((log p_θ(y_t) − μ_s) / τ_s)   [self-paced score]
-  r_t = σ((d_t − μ_r) / τ_r)             [drift score]
-  d_t = log p_θ(y_t) − running_mean       [temporal drift]
+Drift-Trust-A (anchoring):
+  w_t = w_0 + λ · r_t
+  w_t ∈ [0.1, 4.1]
 """
 
 from axolotl.integrations.base import BasePlugin
@@ -43,7 +47,7 @@ LOG = get_logger(__name__)
 
 class RCCATRPlugin(BasePlugin):
     """
-    Plugin for RCCA-TR.
+    Plugin for Drift-Trust.
 
     Memory: ~1× model size (just the active model).
     Evidence drift is tracked via a lightweight scalar EMA buffer.
@@ -65,17 +69,13 @@ class RCCATRPlugin(BasePlugin):
     def get_training_args(self, cfg):
         return {
             "rcca_tr_mode": cfg.rcca_tr_mode,
-            "rcca_tr_tau_p": cfg.rcca_tr_tau_p,
-            "rcca_tr_T_p": cfg.rcca_tr_T_p,
-            "rcca_tr_tau_delta": cfg.rcca_tr_tau_delta,
-            "rcca_tr_T_delta": cfg.rcca_tr_T_delta,
-            "rcca_tr_w_min": cfg.rcca_tr_w_min,
-            "rcca_tr_beta": cfg.rcca_tr_beta,
+            "rcca_tr_ema_decay": cfg.rcca_tr_ema_decay,
             "rcca_tr_self_tau": cfg.rcca_tr_self_tau,
             "rcca_tr_drift_tau": cfg.rcca_tr_drift_tau,
+            "rcca_tr_w_min": cfg.rcca_tr_w_min,
+            "rcca_tr_beta": cfg.rcca_tr_beta,
             "rcca_tr_drift_gamma": cfg.rcca_tr_drift_gamma,
-            "rcca_tr_ema_decay": cfg.rcca_tr_ema_decay,
-            "rcca_tr_kl_lambda": cfg.rcca_tr_kl_lambda,
-            "rcca_tr_anchor_weight": cfg.rcca_tr_anchor_weight,
+            "rcca_tr_anchor_base": cfg.rcca_tr_anchor_base,
+            "rcca_tr_anchor_lambda": cfg.rcca_tr_anchor_lambda,
             "rcca_tr_reliability_tau": cfg.rcca_tr_reliability_tau,
         }

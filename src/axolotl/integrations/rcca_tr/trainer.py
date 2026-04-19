@@ -13,9 +13,11 @@
 # limitations under the License.
 
 """
-RCCA-TR Trainer.
+Drift-Trust Trainer.
 
-Single trainer class for all four modes {ce, hardness, drift_only, drift}.
+Single trainer class for all four modes:
+  {ce, hardness, drift_trust_s, drift_trust_a}
+
 Mode selection is controlled by ``rcca_tr_mode`` in the training args.
 
 Only one model lives in GPU memory — the active model being trained.
@@ -38,6 +40,15 @@ from .loss import compute_rcca_loss
 
 LOG = get_logger(__name__)
 
+# Canonical mode names (resolves legacy aliases at init time)
+_LEGACY_MODE_MAP = {
+    "drift_only": "drift_trust_s",
+    "drift": "drift_trust_a",
+}
+
+# Modes that require the drift buffer
+_DRIFT_MODES = {"drift_trust_s", "drift_trust_a"}
+
 
 def _summarize_tensor(
     x: torch.Tensor,
@@ -57,7 +68,7 @@ def _summarize_tensor(
 
 class AxolotlRCCATRTrainer(AxolotlTrainer):
     """
-    RCCA-TR Trainer — unified trainer for all four modes.
+    Drift-Trust Trainer — unified trainer for all four modes.
 
     Memory footprint: only the active model (1× model size).
     Evidence drift is tracked via a lightweight DriftBuffer.
@@ -66,14 +77,15 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.mode = getattr(self.args, "rcca_tr_mode", "drift_only") or "drift_only"
+        raw_mode = getattr(self.args, "rcca_tr_mode", "drift_trust_s") or "drift_trust_s"
+        self.mode = _LEGACY_MODE_MAP.get(raw_mode, raw_mode)
         ema_decay = getattr(self.args, "rcca_tr_ema_decay", 0.999) or 0.999
 
-        # Initialize drift buffer (used by drift_only and drift modes)
+        # Initialize drift buffer (used by drift_trust_s and drift_trust_a)
         self.drift_buffer = DriftBuffer(decay=ema_decay)
 
         LOG.info(
-            "RCCA-TR trainer initialized (mode=%s, ema_decay=%.4f)",
+            "Drift-Trust trainer initialized (mode=%s, ema_decay=%.4f)",
             self.mode,
             ema_decay,
         )
@@ -106,9 +118,9 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         num_items_in_batch=None,
     ):
         """
-        Compute RCCA-TR loss using the unified dispatch.
+        Compute Drift-Trust loss using the unified dispatch.
 
-        During training: uses the configured mode (ce/hardness/drift_only/drift).
+        During training: uses the configured mode (ce/hardness/drift_trust_s/drift_trust_a).
         During eval: falls back to standard CE for proper eval_loss metric.
         """
         # Handle sample packing
@@ -156,9 +168,9 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
 
         valid_mask = labels != -100
 
-        # ── Compute drift (for drift_only / drift modes) ──
+        # ── Compute shared drift signal (for drift modes) ──
         drift = None
-        if self.mode in ("drift_only", "drift"):
+        if self.mode in _DRIFT_MODES:
             with torch.no_grad():
                 active_logp = self._get_logp(logits, labels, valid_mask)
             drift = self.drift_buffer.get_current_drift(active_logp, valid_mask)
@@ -175,13 +187,13 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             beta=getattr(self.args, "rcca_tr_beta", 0.5) or 0.5,
             gamma=getattr(self.args, "rcca_tr_drift_gamma", 1.0) or 1.0,
             reliability_tau=getattr(self.args, "rcca_tr_reliability_tau", 1.0) or 1.0,
-            kl_lambda=getattr(self.args, "rcca_tr_kl_lambda", 4.0) or 4.0,
-            anchor_weight=getattr(self.args, "rcca_tr_anchor_weight", 0.1) or 0.1,
+            anchor_base=getattr(self.args, "rcca_tr_anchor_base", 0.1) or 0.1,
+            anchor_lambda=getattr(self.args, "rcca_tr_anchor_lambda", 4.0) or 4.0,
             num_items_in_batch=num_items_in_batch,
         )
 
         # ── Update drift buffer ──
-        if self.mode in ("drift_only", "drift"):
+        if self.mode in _DRIFT_MODES:
             with torch.no_grad():
                 active_logp = self._get_logp(logits, labels, valid_mask)
             self.drift_buffer.step(active_logp, valid_mask)
@@ -202,16 +214,24 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
         Log paper-grade training statistics.
 
         Emits:
+          - train/mode (0=ce, 1=hardness, 2=drift_trust_s, 3=drift_trust_a)
           - train/w_mean, w_q10, w_q50, w_q90
           - train/s_mean, r_mean (when available)
           - train/ce_mean
           - train/suppressed_frac (w_t < 0.2)
-          - train/high_weight_frac (w_t > 0.8)
+          - train/high_weight_frac (w_t > 0.8 for S, w_t > 1.5 for A)
           - train/drift_buffer_mean
         """
         shift_mask = labels[..., 1:] != -100
 
-        log_dict = {"train/mode": {"ce": 0, "hardness": 1, "drift_only": 2, "drift": 3}.get(self.mode, -1)}
+        mode_id = {
+            "ce": 0,
+            "hardness": 1,
+            "drift_trust_s": 2,
+            "drift_trust_a": 3,
+        }.get(self.mode, -1)
+
+        log_dict = {"train/mode": mode_id}
 
         if "w_t" in stats:
             w_stats = _summarize_tensor(stats["w_t"], shift_mask)
@@ -227,7 +247,9 @@ class AxolotlRCCATRTrainer(AxolotlTrainer):
             if w_masked.numel() > 0:
                 total = w_masked.numel()
                 log_dict["train/suppressed_frac"] = (w_masked < 0.2).float().sum().item() / total
-                log_dict["train/high_weight_frac"] = (w_masked > 0.8).float().sum().item() / total
+                # Use regime-appropriate threshold for "high weight"
+                high_thresh = 1.5 if self.mode == "drift_trust_a" else 0.8
+                log_dict["train/high_weight_frac"] = (w_masked > high_thresh).float().sum().item() / total
 
         if "s_t" in stats:
             s_stats = _summarize_tensor(stats["s_t"], shift_mask)
