@@ -70,7 +70,7 @@ eval_if_needed() {
 
     if [ ! -d "${model_path}" ] && [[ "${model_path}" != Qwen/* ]]; then
         echo "[eval] ${desc} — SKIP (no checkpoint)"
-        return 1
+        return 0
     fi
 
     # Check if results already exist (handle hidden dirs from lm-eval)
