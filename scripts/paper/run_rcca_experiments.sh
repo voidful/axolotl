@@ -185,6 +185,15 @@ phase_data() {
         echo "[data] medical_flashcards_10k.jsonl — exists"
     fi
 
+    # Math dataset
+    if [ ! -f "${DATA_DIR}/numina_math_cot_10k.jsonl" ]; then
+        echo "[data] Creating math SFT dataset..."
+        python3 "${PAPER_SCRIPTS}/sample_numina_math.py" \
+            --output_dir "${DATA_DIR}" --num_samples 10000 --seed 42
+    else
+        echo "[data] numina_math_cot_10k.jsonl — exists"
+    fi
+
     # Noise Sweep datasets
     local noise_fracs=("0:0.0" "10:0.1" "25:0.25" "50:0.5" "75:0.75")
     for item in "${noise_fracs[@]}"; do
@@ -238,10 +247,10 @@ phase_train_math() {
     echo "=== TRAIN: Math (Battle B) ==="
 
     local dataset
-    if [ -f "${DATA_DIR}/numinamath_cot_10k.jsonl" ]; then
-        dataset="${DATA_DIR}/numinamath_cot_10k.jsonl"
+    if [ -f "${DATA_DIR}/numina_math_cot_10k.jsonl" ]; then
+        dataset="${DATA_DIR}/numina_math_cot_10k.jsonl"
     else
-        echo "[train] Math dataset not found at ${DATA_DIR}/numinamath_cot_10k.jsonl"
+        echo "[train] Math dataset not found at ${DATA_DIR}/numina_math_cot_10k.jsonl"
         echo "[train] Using existing checkpoints for eval only"
         return 0
     fi
