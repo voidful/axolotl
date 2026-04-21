@@ -13,126 +13,68 @@
 # limitations under the License.
 
 """
-Drift buffer for Drift variant.
+Minimal EMA reference buffer for drift-loss.
 
-Tracks how much the active model's predictions diverge from baseline (zeros)
-over time, providing a temporal evidence signal without storing a full model copy.
+The no-cache default keeps a single scalar EMA over valid target log-probabilities:
 
-Usage:
-    drift_t = decay * drift_t + (1-decay) * |log p_θ(y_t) - 0|
-    r_evi = exp(-gamma * drift_t)
+  m <- decay * m + (1 - decay) * mean_valid(log p_theta(y_t))
+
+This is the only persistent temporal state needed by drift-loss-EMA.
 """
+
+from __future__ import annotations
 
 import torch
 
 
-class DriftBuffer:
+class DriftMeanBuffer:
     """
-    Maintains a running exponential drift statistic.
-
-    Instead of keeping an entire EMA model, we track a single scalar drift
-    per token position in each batch. This provides the temporal evidence
-    signal for reliability estimation.
-
-    Without a prior cache, drift equals the active model's CE (|log p_θ(y_t)|).
+    Maintain a scalar EMA reference over valid target log-probabilities.
     """
 
-    def __init__(self, decay: float = 0.999, gamma: float = 1.0):
+    def __init__(self, decay: float = 0.999):
         """
         Args:
-            decay: EMA decay for the drift buffer. Higher = slower adaptation.
-            gamma: Scaling factor for drift → reliability mapping.
+            decay: EMA decay. Higher values keep a longer temporal memory.
         """
         self.decay = decay
-        self.gamma = gamma
-        self._running_drift = 0.0  # scalar running average
-
-    def get_current_drift(
-        self,
-        active_target_logp: torch.Tensor,
-        valid_mask: torch.Tensor,
-        per_sample: bool = False,
-    ) -> torch.Tensor:
-        """
-        Compute per-token drift using the current running average (without updating it).
-
-        drift_t = |log p_θ(y_t)|  (= CE_t since log p is negative)
-
-        When per_sample=True, uses sample-level mean CE instead of token-level CE.
-        This prevents novel-knowledge tokens (high CE) from being suppressed when
-        the surrounding context is coherent (low CE).
-
-        Returns blended drift: 0.5 * instant + 0.5 * running_average.
-
-        Args:
-            active_target_logp: log p_θ(y_t), shape (B, T).
-            valid_mask: Boolean mask for valid tokens, shape (B, T).
-            per_sample: If True, average CE per sample before reliability.
-
-        Returns:
-            Per-token drift values, shape (B, T).
-        """
-        instant_drift_raw = active_target_logp.abs()
-
-        if per_sample:
-            # Per-sample averaging: new knowledge tokens get "bailed out"
-            # by coherent context within the same sample
-            sample_sum = (instant_drift_raw * valid_mask.float()).sum(dim=1, keepdim=True)
-            sample_valid_len = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1e-5)
-            sample_mean_drift = sample_sum / sample_valid_len
-            instant_drift = sample_mean_drift.expand_as(instant_drift_raw)
-        else:
-            instant_drift = instant_drift_raw
-
-        blended_drift = (
-            0.5 * instant_drift
-            + 0.5 * self._running_drift
-        )
-        return blended_drift * valid_mask.float()
+        self.running_mean: float = 0.0
+        self.initialized: bool = False
 
     def step(
         self,
         active_target_logp: torch.Tensor,
         valid_mask: torch.Tensor,
-    ):
+    ) -> None:
         """
-        Update the running drift average with the current batch's mean drift.
-
-        d = decay * d + (1 - decay) * mean(|log p_θ(y_t)|)
+        Update the EMA reference with the current batch mean.
 
         Args:
-            active_target_logp: log p_θ(y_t), shape (B, T).
+            active_target_logp: Valid-token log-probs, shape (B, T).
             valid_mask: Boolean mask for valid tokens, shape (B, T).
         """
-        instant_drift = active_target_logp.abs()
         if valid_mask.any():
-            batch_mean_drift = instant_drift[valid_mask].mean().item()
+            batch_mean = active_target_logp[valid_mask].mean().item()
         else:
-            batch_mean_drift = 0.0
+            batch_mean = 0.0
 
-        self._running_drift = (
-            self.decay * self._running_drift
-            + (1.0 - self.decay) * batch_mean_drift
+        if not self.initialized:
+            self.running_mean = batch_mean
+            self.initialized = True
+            return
+
+        self.running_mean = (
+            self.decay * self.running_mean
+            + (1.0 - self.decay) * batch_mean
         )
 
-    def get_evidence_reliability(self, drift: torch.Tensor) -> torch.Tensor:
+    def get_reference(self) -> float:
         """
-        Convert drift values to evidence reliability scores.
-
-        r_evi = exp(-gamma * drift)
-
-        High drift → low reliability (model uncertain).
-        Low drift → high reliability (model confident).
-
-        Args:
-            drift: Per-token drift values, shape (B, T).
-
-        Returns:
-            Evidence reliability scores in [0, 1], shape (B, T).
+        Return the current scalar EMA reference.
         """
-        return torch.exp(-self.gamma * drift)
+        return float(self.running_mean)
 
     @property
-    def running_drift(self) -> float:
-        """Current running drift average."""
-        return self._running_drift
+    def state(self) -> float:
+        """Alias for logging consistency with other buffers."""
+        return self.running_mean

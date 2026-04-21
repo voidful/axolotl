@@ -5,7 +5,7 @@ MATH-500 Pass@k Evaluation via vLLM.
 Evaluates test-time scaling by sampling k responses per problem and computing
 Pass@1, Pass@16, Pass@64. Uses vLLM for efficient batched generation.
 
-This is the core Battle B evaluation script for the Drift-Trust paper.
+This is the core Battle B evaluation script for the drift-loss paper.
 
 Usage:
     python eval_math_passk.py \

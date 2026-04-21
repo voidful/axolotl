@@ -13,16 +13,18 @@
 # limitations under the License.
 
 """
-Plugin init for Drift variant.
+Plugin init for drift-loss.
 
-Drift-based trust-region fine-tuning with:
-  - DriftBuffer for temporal evidence tracking
-  - Only the active model in GPU memory
-  - No frozen prior cache required
+drift-loss keeps CE as the base loss, and only uses drift to measure
+improvement versus a reference state.
 
-  drift_t = 0.5 · CE_t + 0.5 · d_running
-  r_t = σ((exp(-γ · drift_t) - μ) / τ)
-  L = λ · r_t · CE_t
+Default:
+  - scalar EMA reference
+  - detached mean-preserving focal weights
+  - one primary tuning parameter: drift_gamma
+
+Appendix-style variant:
+  - token-wise prior reference via `reference_target_logp`
 """
 
 from axolotl.integrations.base import BasePlugin
@@ -35,10 +37,10 @@ LOG = get_logger(__name__)
 
 class DriftPlugin(BasePlugin):
     """
-    Plugin for Drift variant.
+    Plugin for drift-loss.
 
     Memory: ~1× model size (just the active model).
-    Evidence drift is tracked via a lightweight statistical buffer.
+    Default temporal state is a single scalar EMA reference.
     """
 
     def get_input_args(self):
@@ -56,6 +58,13 @@ class DriftPlugin(BasePlugin):
 
     def get_training_args(self, cfg):
         return {
+            "drift_reference_mode": cfg.drift_reference_mode,
+            "drift_reference_key": cfg.drift_reference_key,
+            "drift_ema_decay": cfg.drift_ema_decay,
+            "drift_gamma": cfg.drift_gamma,
+            "drift_detach_weights": cfg.drift_detach_weights,
+            "drift_eps": cfg.drift_eps,
+            # Legacy trust-region args are still forwarded for compatibility.
             "drift_reliability_beta": cfg.drift_reliability_beta,
             "drift_reliability_tau": cfg.drift_reliability_tau,
             "drift_epsilon_min": cfg.drift_epsilon_min,
@@ -63,6 +72,5 @@ class DriftPlugin(BasePlugin):
             "drift_kl_lambda": cfg.drift_kl_lambda,
             "drift_anchor_weight": cfg.drift_anchor_weight,
             "drift_use_smooth_objective": cfg.drift_use_smooth_objective,
-            "drift_ema_decay": cfg.drift_ema_decay,
-            "drift_gamma": cfg.drift_gamma,
+            "drift_per_sample": cfg.drift_per_sample,
         }

@@ -1,4 +1,4 @@
-# Drift-Trust Paper — CE Baseline on Medical SFT
+# drift-loss paper — CE Baseline on Medical SFT
 # Battle C: Domain Specialization
 # Model: Qwen3.5-4B (standard cross-entropy, no drift)
 

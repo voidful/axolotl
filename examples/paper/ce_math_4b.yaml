@@ -1,4 +1,4 @@
-# Drift-Trust Paper — CE Baseline on NuminaMath-CoT
+# drift-loss paper — CE Baseline on NuminaMath-CoT
 # Battle B: Unlocking Test-Time Scaling
 # Model: Qwen3.5-4B (standard cross-entropy, no drift)
 

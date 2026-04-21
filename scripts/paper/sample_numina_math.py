@@ -3,7 +3,7 @@
 Sample 10k examples from NuminaMath-CoT for long chain-of-thought training.
 
 This dataset is used for Battle B: Test-Time Scaling.
-We want to test whether Drift-Trust preserves sampling diversity (Pass@k)
+We want to test whether drift-loss preserves sampling diversity (Pass@k)
 better than standard CE which causes mode collapse.
 
 Usage:

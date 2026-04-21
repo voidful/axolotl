@@ -13,10 +13,21 @@
 # limitations under the License.
 
 """
-Plugin args for Drift variant.
+Plugin args for drift-loss.
+
+The new method centers on a single focal-style tuning parameter, `drift_gamma`,
+while keeping the reference path explicit:
+  - `ema`: scalar running-mean reference (paper default)
+  - `prior`: token-wise frozen-prior reference (appendix-style)
+
+Legacy trust-region fields are retained for config compatibility but ignored by
+the drift-loss trainer.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -28,25 +39,27 @@ class DriftArgs(BaseModel):
 
     drift_trainer: bool | None = None
 
-    # --- Reliability score hyperparameters ---
+    # --- drift-loss core ---
+    drift_reference_mode: Literal["ema", "prior"] | None = "ema"
+    drift_reference_key: str | None = "reference_target_logp"
+    drift_ema_decay: float | None = 0.999
+    drift_gamma: float | None = 2.0
+    drift_detach_weights: bool | None = True
+    drift_eps: float | None = 1e-6
+
+    # --- Legacy trust-region args (ignored; kept for compatibility) ---
     drift_reliability_beta: float | None = (
-        0.5  # balance between stability and evidence reliability
+        0.5
     )
     drift_reliability_tau: float | None = (
-        1.0  # temperature for sigmoid mapping of reliability score
+        1.0
     )
-
-    # --- Trust-region hyperparameters ---
     drift_epsilon_min: float | None = 0.01
     drift_epsilon_max: float | None = 1.0
-    drift_kl_lambda: float | None = 4.0  # modulation strength for clean tokens
-    drift_anchor_weight: float | None = 0.1  # near-zero gradient floor for noisy tokens
+    drift_kl_lambda: float | None = 4.0
+    drift_anchor_weight: float | None = 0.1
     drift_use_smooth_objective: bool | None = True
-
-    # --- Drift buffer ---
-    drift_per_sample: bool | None = False  # Per-sample drift (avg CE per sample)
-    drift_ema_decay: float | None = 0.99  # faster adaptation
-    drift_gamma: float | None = 3.0  # sensitive to CE deviation
+    drift_per_sample: bool | None = False
 
 
 @dataclass
@@ -54,6 +67,13 @@ class DriftTrainingArgsMixin:
     """
     Additional training args for Drift.
     """
+
+    drift_reference_mode: Literal["ema", "prior"] | None = "ema"
+    drift_reference_key: str | None = "reference_target_logp"
+    drift_ema_decay: float | None = 0.999
+    drift_gamma: float | None = 2.0
+    drift_detach_weights: bool | None = True
+    drift_eps: float | None = 1e-6
 
     drift_reliability_beta: float | None = 0.5
     drift_reliability_tau: float | None = 1.0
@@ -63,5 +83,3 @@ class DriftTrainingArgsMixin:
     drift_anchor_weight: float | None = 0.1
     drift_use_smooth_objective: bool | None = True
     drift_per_sample: bool | None = False
-    drift_ema_decay: float | None = 0.99
-    drift_gamma: float | None = 3.0

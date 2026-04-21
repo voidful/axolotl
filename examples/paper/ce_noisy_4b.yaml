@@ -1,4 +1,4 @@
-# Drift-Trust Paper — CE Baseline on Noisy UltraFeedback
+# drift-loss paper — CE Baseline on Noisy UltraFeedback
 # Battle A: Mitigating Alignment Tax
 # Model: Qwen3.5-4B (standard cross-entropy, no drift)
 

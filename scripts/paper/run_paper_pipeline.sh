@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Drift-Trust NeurIPS 2026 — Master Execution Script
+# drift-loss NeurIPS 2026 — Master Execution Script
 # ============================================================
 #
 # This script orchestrates the full paper pipeline:
@@ -34,7 +34,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PHASE="${1:-all}"
 
 echo "============================================"
-echo "  Drift-Trust NeurIPS 2026 Pipeline"
+echo "  drift-loss NeurIPS 2026 Pipeline"
 echo "  Phase: ${PHASE}"
 echo "  Project: ${PROJECT_DIR}"
 echo "============================================"
@@ -69,13 +69,13 @@ if [[ "${PHASE}" == "train" || "${PHASE}" == "all" ]]; then
     echo "[1/6] CE on noisy UltraFeedback..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/ce_noisy_4b.yaml"
 
-    echo "[2/6] Drift-Trust on noisy UltraFeedback..."
+    echo "[2/6] drift-loss on noisy UltraFeedback..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_noisy_4b.yaml"
 
     echo "[3/6] CE on NuminaMath-CoT..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/ce_math_4b.yaml"
 
-    echo "[4/6] Drift-Trust on NuminaMath-CoT..."
+    echo "[4/6] drift-loss on NuminaMath-CoT..."
     accelerate launch -m axolotl.cli.train "${PAPER_CONFIGS}/drift_math_4b.yaml"
 
     echo "[5/6] Route C: Per-Sample Drift on noisy UltraFeedback..."
@@ -101,7 +101,7 @@ if [[ "${PHASE}" == "eval" || "${PHASE}" == "all" ]]; then
     bash "${PAPER_SCRIPTS}/eval_benchmarks.sh" \
         "${PROJECT_DIR}/outputs/paper/ce-noisy-4b" "ce_noisy_4b"
 
-    echo "[Battle A] Evaluating Drift-Trust (noisy)..."
+    echo "[Battle A] Evaluating drift-loss (noisy)..."
     bash "${PAPER_SCRIPTS}/eval_benchmarks.sh" \
         "${PROJECT_DIR}/outputs/paper/drift-noisy-4b" "drift_noisy_4b"
 
@@ -128,7 +128,7 @@ if [[ "${PHASE}" == "eval" || "${PHASE}" == "all" ]]; then
         --output_dir "${RESULTS_DIR}" \
         --run_name "ce_math_4b"
 
-    echo "[Battle B] Evaluating Drift-Trust (math) Pass@k..."
+    echo "[Battle B] Evaluating drift-loss (math) Pass@k..."
     python "${PAPER_SCRIPTS}/eval_math_passk.py" \
         --model_path "${PROJECT_DIR}/outputs/paper/drift-math-4b" \
         --k 64 --temperature 0.7 \

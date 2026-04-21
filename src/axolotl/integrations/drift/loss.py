@@ -13,126 +13,219 @@
 # limitations under the License.
 
 """
-Core loss functions for Drift variant.
+Core loss functions for drift-loss.
 
-Uses the active model's CE as the drift signal.
-No frozen prior cache is needed.
+Paper default:
+  1. CE already captures hardness.
+  2. Drift only captures usefulness/improvement versus a reference state.
+  3. Gamma is the only focal-style sharpening parameter.
 
-Token-level signal:
-  - Reliability score (r_t): drift-based evidence reliability.
-    r_evi = exp(-γ · d_t), then z-score + sigmoid.
-
-Trust-region objective:
-  L_t = λ · r_t · CE_t   (smooth form)
+Two reference modes are supported:
+  - scalar EMA reference: current log-prob versus a running mean
+  - token-wise prior reference: current log-prob versus token-aligned prior log-prob
 """
 
+from __future__ import annotations
+
 import torch
-import torch.nn.functional as F
 
 
-def compute_reliability_from_drift(
-    drift: torch.Tensor,
-    gamma: float = 1.0,
-    tau: float = 1.0,
+def _shift_for_next_token(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Shift logits and labels for next-token prediction.
+
+    Args:
+        logits: Model logits, shape (B, T, V).
+        labels: Token labels, shape (B, T).
+
+    Returns:
+        Tuple of shifted logits, shifted labels, and valid-token mask.
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    shift_mask = shift_labels != -100
+    return shift_logits, shift_labels, shift_mask
+
+
+def _gather_target_logp(
+    shift_logits: torch.Tensor,
+    shift_labels: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Compute combined reliability from drift buffer.
-
-    r_evi = exp(-γ · d_t)
-    r_t = σ((r_evi - μ) / τ)
+    Gather target token log-probabilities without materializing full log_softmax.
 
     Args:
-        drift: Per-token drift values, shape (B, T).
-        gamma: Scaling factor for drift → reliability.
-        tau: Temperature for sigmoid normalization.
+        shift_logits: Shifted logits, shape (B, T-1, V).
+        shift_labels: Shifted labels, shape (B, T-1).
 
     Returns:
-        r_t: Reliability scores in [0, 1], shape (B, T).
+        Target log-probs, shape (B, T-1).
     """
-    r_evi = torch.exp(-gamma * drift)
-
-    # Center and normalize
-    mu = r_evi.mean()
-    normalized = (r_evi - mu) / tau
-
-    r_t = torch.sigmoid(normalized)
-
-    return r_t
+    safe_labels = shift_labels.clamp(min=0)
+    target_logit = shift_logits.gather(
+        dim=-1,
+        index=safe_labels.unsqueeze(-1),
+    ).squeeze(-1)
+    log_z = torch.logsumexp(shift_logits, dim=-1)
+    return target_logit - log_z
 
 
-def compute_trust_region_loss(
+def _broadcast_reference(
+    reference_target_logp: torch.Tensor | float,
+    target_shape: torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, str]:
+    """
+    Broadcast a scalar or token-wise reference to the shifted target shape.
+
+    Args:
+        reference_target_logp: Scalar EMA reference or token-wise prior log-probs.
+        target_shape: Expected shifted token shape, usually (B, T-1).
+        device: Output device.
+        dtype: Output dtype.
+
+    Returns:
+        Tuple of broadcast reference log-probs and reference type.
+    """
+    if not torch.is_tensor(reference_target_logp):
+        ref = torch.full(
+            target_shape,
+            float(reference_target_logp),
+            device=device,
+            dtype=dtype,
+        )
+        return ref, "scalar"
+
+    ref = reference_target_logp.to(device=device, dtype=dtype)
+
+    if ref.ndim == 0:
+        ref = torch.full(
+            target_shape,
+            float(ref.item()),
+            device=device,
+            dtype=dtype,
+        )
+        return ref, "scalar"
+
+    if ref.shape == target_shape:
+        return ref, "token"
+
+    if (
+        ref.ndim == 2
+        and ref.shape[0] == target_shape[0]
+        and ref.shape[1] == target_shape[1] + 1
+    ):
+        return ref[..., 1:].contiguous(), "token"
+
+    raise ValueError(
+        f"Unsupported reference_target_logp shape {tuple(ref.shape)} "
+        f"for target shape {tuple(target_shape)}"
+    )
+
+
+def compute_drift_focal_loss(
     active_logits: torch.Tensor,
     labels: torch.Tensor,
-    r_t: torch.Tensor,
-    kl_lambda: float = 1.0,
-    anchor_weight: float = 0.5,
-    epsilon_min: float = 0.01,
-    epsilon_max: float = 1.0,
-    use_smooth: bool = True,
+    reference_target_logp: torch.Tensor | float,
+    gamma: float = 2.0,
+    eps: float = 1e-6,
+    detach_weights: bool = True,
     num_items_in_batch: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, object]]:
     """
-    Compute trust-region loss with anchor CE floor.
-
-    Loss = anchor_weight · CE_t + λ · r_t · CE_t
-         = (anchor_weight + λ · r_t) · CE_t
-
-    The anchor term ensures every token gets at least anchor_weight × CE of
-    learning signal, even when r_t → 0 (high drift / low reliability).
+    Compute the one-parameter drift-loss objective.
 
     Args:
-        active_logits: Logits from active model, shape (B, T, V).
-        labels: Ground-truth token IDs, shape (B, T). -100 = ignore.
-        r_t: Reliability scores, shape (B, T).
-        kl_lambda: Lagrange multiplier for drift-modulated term.
-        anchor_weight: Baseline CE weight (0 = pure drift, 0.5 = RCCA-TR style).
-        epsilon_min: Min trust-region radius (hinge only).
-        epsilon_max: Max trust-region radius (hinge only).
-        use_smooth: If True, smooth form; otherwise hinge.
-        num_items_in_batch: For sample packing normalization.
+        active_logits: Logits from the active model, shape (B, T, V).
+        labels: Ground-truth token IDs, shape (B, T), with -100 ignored.
+        reference_target_logp: Scalar EMA reference or token-wise prior log-prob.
+        gamma: Focal-style sharpening parameter. gamma=0 recovers standard CE.
+        eps: Numerical stability term.
+        detach_weights: If True, detach the weight path (paper default).
+        num_items_in_batch: Optional packed-sequence reduction denominator.
 
     Returns:
-        Tuple of (scalar loss, active_target_logp_shifted for drift buffer update).
+        Tuple of scalar loss and intermediate stats.
     """
-    # Shift for next-token prediction
-    shift_logits = active_logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    shift_safe_labels = shift_labels.clamp(min=0)
-    shift_mask = shift_labels != -100
-    shift_r = r_t[..., 1:].contiguous()
+    if gamma < 0:
+        raise ValueError(f"gamma must be >= 0, got {gamma}")
 
-    vocab_size = shift_logits.size(-1)
+    shift_logits, shift_labels, shift_mask = _shift_for_next_token(
+        active_logits,
+        labels,
+    )
+    mask_float = shift_mask.float()
 
-    # Per-token CE loss
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-    per_token_ce = ce_loss_fn(
-        shift_logits.view(-1, vocab_size),
-        shift_safe_labels.view(-1),
-    ).view(shift_labels.shape)  # (B, T-1)
+    active_target_logp = _gather_target_logp(shift_logits, shift_labels)
+    active_target_logp = active_target_logp * mask_float
+    ce_t = -active_target_logp
 
-    # Anchor: baseline CE floor
-    anchor_term = anchor_weight * per_token_ce * shift_mask.float()
+    ref_logp, ref_type = _broadcast_reference(
+        reference_target_logp=reference_target_logp,
+        target_shape=active_target_logp.shape,
+        device=active_target_logp.device,
+        dtype=active_target_logp.dtype,
+    )
+    ref_logp = ref_logp * mask_float
 
-    # KL proxy: CE_t (since no prior cache)
-    kl_proxy = per_token_ce.clamp(min=0.0)  # (B, T-1)
+    delta_t = (active_target_logp - ref_logp) * mask_float
 
-    if use_smooth:
-        # Smooth: λ · r_t · KL_proxy
-        drift_term = kl_lambda * shift_r * kl_proxy * shift_mask.float()
+    if shift_mask.any():
+        valid_delta = delta_t[shift_mask]
+        std_delta = valid_delta.detach().std(unbiased=False)
+        if ref_type == "scalar":
+            mu_delta = delta_t.new_zeros(())
+            delta_norm = delta_t / (std_delta + eps)
+        else:
+            mu_delta = valid_delta.detach().mean()
+            delta_norm = (delta_t - mu_delta) / (std_delta + eps)
     else:
-        # Hinge: λ · max(0, KL_proxy - ε_t)
-        epsilon_t = epsilon_max - shift_r * (epsilon_max - epsilon_min)
-        kl_hinge = torch.clamp(kl_proxy - epsilon_t, min=0.0)
-        drift_term = kl_lambda * kl_hinge * shift_mask.float()
+        mu_delta = delta_t.new_zeros(())
+        std_delta = delta_t.new_ones(())
+        delta_norm = delta_t
 
-    # Combine: (anchor_weight + λ · r_t) · CE
-    total_per_token = anchor_term + drift_term
+    delta_norm = delta_norm * mask_float
+    u_t = torch.sigmoid(delta_norm) * mask_float
+
+    if gamma == 0.0:
+        w_raw = mask_float.clone()
+    else:
+        w_raw = u_t.clamp(min=eps).pow(gamma) * mask_float
+
+    if shift_mask.any():
+        mean_w = w_raw[shift_mask].detach().mean()
+    else:
+        mean_w = w_raw.new_ones(())
+
+    w_t = (w_raw / (mean_w + eps)) * mask_float
+    weighted_w = w_t.detach() if detach_weights else w_t
+    weighted_ce = weighted_w * ce_t * mask_float
 
     if num_items_in_batch is not None:
-        loss = total_per_token.sum() / num_items_in_batch
+        denom = active_logits.new_tensor(max(float(num_items_in_batch), 1.0))
     else:
-        num_valid = shift_mask.float().sum().clamp(min=1.0)
-        loss = total_per_token.sum() / num_valid
+        denom = mask_float.sum().clamp(min=1.0)
 
-    return loss, None
+    loss = weighted_ce.sum() / denom
 
+    stats: dict[str, object] = {
+        "shift_mask": shift_mask,
+        "reference_type": ref_type,
+        "active_target_logp": active_target_logp.detach(),
+        "reference_target_logp": ref_logp.detach(),
+        "ce_t": ce_t.detach(),
+        "delta_t": delta_t.detach(),
+        "delta_norm": delta_norm.detach(),
+        "u_t": u_t.detach(),
+        "w_raw": w_raw.detach(),
+        "w_t": w_t.detach(),
+        "mu_delta": mu_delta.detach(),
+        "std_delta": std_delta.detach(),
+        "mean_w": mean_w.detach(),
+    }
+
+    return loss, stats

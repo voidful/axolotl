@@ -74,11 +74,11 @@ def plot_left_panel(ax, data):
             label=info.get('label', method),
         )
 
-    # Highlight Drift-Trust's golden position
+    # Highlight drift-loss's golden position
     if 'drift' in data:
         drift = data['drift']
         ax.annotate(
-            'Drift-Trust\n(Ours)',
+            'drift-loss\n(Ours)',
             xy=(drift['vram_gb'], drift['mmlu_pro']),
             xytext=(drift['vram_gb'] + 1.5, drift['mmlu_pro'] - 2),
             fontsize=9, fontweight='bold', color=COLORS['drift'],
@@ -151,10 +151,10 @@ def load_results(results_dir: str):
             if "ce" in name:
                 left_data["ce"] = {"vram_gb": r.get("peak_vram_gb", 9.2), "label": "Standard CE"}
             elif "drift" in name:
-                left_data["drift"] = {"vram_gb": r.get("peak_vram_gb", 9.5), "label": "Drift-Trust (Ours)"}
+                left_data["drift"] = {"vram_gb": r.get("peak_vram_gb", 9.5), "label": "drift-loss (Ours)"}
 
     # Load Pass@k results
-    for method, label in [("ce_math_4b", "Standard CE"), ("drift_math_4b", "Drift-Trust (Ours)")]:
+    for method, label in [("ce_math_4b", "Standard CE"), ("drift_math_4b", "drift-loss (Ours)")]:
         pk_file = Path(results_dir) / f"math500_passk_{method}.json"
         if pk_file.exists():
             with open(pk_file) as f:
@@ -169,7 +169,7 @@ def load_results(results_dir: str):
             'ce_clean': {'vram_gb': 9.2, 'mmlu_pro': 48.5, 'label': 'CE (Clean Data)'},
             'ce': {'vram_gb': 9.2, 'mmlu_pro': 43.1, 'label': 'Standard CE (Noisy)'},
             'dpo': {'vram_gb': 18.4, 'mmlu_pro': 47.8, 'label': 'DPO'},
-            'drift': {'vram_gb': 9.5, 'mmlu_pro': 47.6, 'label': 'Drift-Trust (Ours)'},
+            'drift': {'vram_gb': 9.5, 'mmlu_pro': 47.6, 'label': 'drift-loss (Ours)'},
         }
 
     if not right_data:
@@ -183,7 +183,7 @@ def load_results(results_dir: str):
                 },
             },
             'drift': {
-                'label': 'Drift-Trust (Ours)',
+                'label': 'drift-loss (Ours)',
                 'pass_at_k': {
                     'pass@1': 0.34, 'pass@2': 0.43, 'pass@4': 0.52,
                     'pass@8': 0.60, 'pass@16': 0.66, 'pass@32': 0.71, 'pass@64': 0.75,

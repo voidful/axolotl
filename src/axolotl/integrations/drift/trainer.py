@@ -13,16 +13,14 @@
 # limitations under the License.
 
 """
-Drift Trainer.
+drift-loss trainer.
 
-Only one model lives in GPU memory — the active model being trained.
-Evidence drift is tracked via a lightweight drift buffer using the
-active model's own CE as the drift signal.
-
-On each step, it computes:
-  - Drift-based reliability r_t
-  - Trust-region loss: λ · r_t · CE
+Default mode uses a scalar EMA reference over recent target log-probabilities.
+An appendix-style token-wise prior reference is also supported when the batch
+contains a `reference_target_logp` tensor (or a custom key).
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
@@ -31,38 +29,39 @@ from typing_extensions import override
 from axolotl.core.trainers.base import AxolotlTrainer
 from axolotl.utils.logging import get_logger
 
-from .drift import DriftBuffer
-from .loss import (
-    compute_reliability_from_drift,
-    compute_trust_region_loss,
-)
+from .drift import DriftMeanBuffer
+from .loss import compute_drift_focal_loss
 
 LOG = get_logger(__name__)
 
 
 class AxolotlDriftTrainer(AxolotlTrainer):
     """
-    Drift Trust-Region Trainer.
-
-    Memory footprint: only the active model (1× model size).
-    Evidence drift is tracked via a lightweight DriftBuffer using
-    the active model's CE as the sole drift signal.
+    drift-loss trainer with EMA or token-wise prior references.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        LOG.info("Initializing Drift trainer...")
+        ema_decay = getattr(self.args, "drift_ema_decay", None)
+        if ema_decay is None:
+            ema_decay = 0.999
 
-        # Initialize drift buffer
-        ema_decay = getattr(self.args, "drift_ema_decay", 0.999) or 0.999
-        drift_gamma = getattr(self.args, "drift_gamma", 1.0) or 1.0
-        self.drift_buffer = DriftBuffer(decay=ema_decay, gamma=drift_gamma)
+        reference_mode = getattr(self.args, "drift_reference_mode", None) or "ema"
+        drift_gamma = getattr(self.args, "drift_gamma", None)
+        if drift_gamma is None:
+            drift_gamma = 2.0
+        detach_weights = getattr(self.args, "drift_detach_weights", True)
+
+        self.drift_buffer = DriftMeanBuffer(decay=ema_decay)
 
         LOG.info(
-            "Drift trainer initialized (drift_decay=%.4f, drift_gamma=%.2f)",
+            "Drift trainer initialized "
+            "(reference_mode=%s, drift_decay=%.4f, drift_gamma=%.2f, detach_weights=%s)",
+            reference_mode,
             ema_decay,
             drift_gamma,
+            detach_weights,
         )
 
     @override
@@ -74,12 +73,8 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         num_items_in_batch=None,
     ):
         """
-        Compute the Drift trust-region loss.
-
-        During training: uses drift buffer + KL proxy.
-        During eval: falls back to standard CE loss for proper eval_loss metric.
+        Compute drift-loss during training and standard CE during eval.
         """
-        # Handle sample packing
         if (
             self.args.sample_packing
             and "attention_mask" in inputs
@@ -87,13 +82,15 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         ):
             del inputs["attention_mask"]
 
-        # Pop labels so the model forward skips internal loss (avoids fp32 upcast)
         labels = inputs.pop("labels", None)
+        reference_key = getattr(self.args, "drift_reference_key", None)
+        if not reference_key:
+            reference_key = "reference_target_logp"
+        reference_target_logp = inputs.pop(reference_key, None)
 
         if num_items_in_batch is None and labels is not None:
             num_items_in_batch = (labels != -100).sum().item()
 
-        # Forward pass — bypass accelerate's fp32 upcast to keep logits in bf16
         import accelerate.utils.operations as accel_ops
         original_convert = accel_ops.convert_to_fp32
         accel_ops.convert_to_fp32 = lambda x: x
@@ -102,7 +99,6 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         finally:
             accel_ops.convert_to_fp32 = original_convert
 
-        # During eval, use standard CE loss (trust-region doesn't apply)
         if not model.training:
             if labels is not None:
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
@@ -116,55 +112,48 @@ class AxolotlDriftTrainer(AxolotlTrainer):
                 loss = outputs.loss if outputs.loss is not None else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
-        active_logits = outputs.logits  # (B, T, V) — stays in bf16
-
         if labels is None:
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
-        B, T = labels.shape
-        valid_mask = labels != -100
+        reference_mode = getattr(self.args, "drift_reference_mode", None) or "ema"
+        if reference_mode == "ema":
+            reference = self.drift_buffer.get_reference()
+        elif reference_mode == "prior":
+            if reference_target_logp is None:
+                raise ValueError(
+                    "drift_reference_mode='prior' requires a token-wise "
+                    f"reference tensor in inputs['{reference_key}']"
+                )
+            reference = reference_target_logp
+        else:
+            raise ValueError(
+                f"Unsupported drift_reference_mode={reference_mode!r}; "
+                "expected 'ema' or 'prior'"
+            )
 
-        # 1. Compute drift-based reliability
-        # Avoid full-vocab log_softmax: use logsumexp + gather (only (B,T) intermediates)
-        with torch.no_grad():
-            safe_labels = labels.clamp(min=0)
-            target_logit = active_logits.gather(
-                dim=-1, index=safe_labels.unsqueeze(-1)
-            ).squeeze(-1)  # (B, T)
-            lse = torch.logsumexp(active_logits, dim=-1)  # (B, T)
-            active_target_logp = (target_logit - lse) * valid_mask.float()
+        drift_gamma = getattr(self.args, "drift_gamma", None)
+        if drift_gamma is None:
+            drift_gamma = 2.0
+        drift_eps = getattr(self.args, "drift_eps", None)
+        if drift_eps is None:
+            drift_eps = 1e-6
 
-        drift = self.drift_buffer.get_current_drift(
-            active_target_logp=active_target_logp,
-            valid_mask=valid_mask,
-            per_sample=getattr(self.args, "drift_per_sample", False) or False,
-        )
-
-        r_t = compute_reliability_from_drift(
-            drift=drift,
-            gamma=getattr(self.args, "drift_gamma", 1.0) or 1.0,
-            tau=getattr(self.args, "drift_reliability_tau", 1.0) or 1.0,
-        )
-
-        # 2. Compute trust-region loss
-        loss, _ = compute_trust_region_loss(
-            active_logits=active_logits,
+        loss, stats = compute_drift_focal_loss(
+            active_logits=outputs.logits,
             labels=labels,
-            r_t=r_t,
-            kl_lambda=getattr(self.args, "drift_kl_lambda", 1.0) or 1.0,
-            anchor_weight=getattr(self.args, "drift_anchor_weight", 0.5) or 0.0,
-            epsilon_min=getattr(self.args, "drift_epsilon_min", 0.01) or 0.01,
-            epsilon_max=getattr(self.args, "drift_epsilon_max", 1.0) or 1.0,
-            use_smooth=getattr(self.args, "drift_use_smooth_objective", True),
+            reference_target_logp=reference,
+            gamma=drift_gamma,
+            eps=drift_eps,
+            detach_weights=getattr(self.args, "drift_detach_weights", True),
             num_items_in_batch=num_items_in_batch,
         )
 
-        # 3. Update drift buffer with this step's values
-        self.drift_buffer.step(
-            active_target_logp=active_target_logp,
-            valid_mask=valid_mask,
-        )
+        if reference_mode == "ema":
+            self.drift_buffer.step(
+                active_target_logp=stats["active_target_logp"],  # type: ignore[arg-type]
+                valid_mask=stats["shift_mask"],  # type: ignore[arg-type]
+            )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -177,7 +166,7 @@ class AxolotlDriftTrainer(AxolotlTrainer):
         ignore_keys=None,
     ):
         """
-        Override prediction_step to use standard CE loss during eval.
+        Use standard CE loss during eval for an apples-to-apples eval metric.
         """
         model_inputs = {
             k: v for k, v in inputs.items()

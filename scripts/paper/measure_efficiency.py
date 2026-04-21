@@ -7,7 +7,7 @@ Runs a short training check (50 steps) with each config and records:
   - Training throughput in tokens/second
   - Wall-clock time per step
 
-Used to fill the efficiency table in the Drift-Trust paper.
+Used to fill the efficiency table in the drift-loss paper.
 
 Usage:
     python measure_efficiency.py \

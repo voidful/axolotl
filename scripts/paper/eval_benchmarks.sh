@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Drift-Trust Paper — Benchmark Evaluation Script
+# drift-loss paper — Benchmark Evaluation Script
 # Battle A: MMLU-Pro + IFEval via lm-evaluation-harness
 # Backend: vLLM (PagedAttention, ~5-10x faster than HF generate)
 # ============================================================

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Drift-Trust NeurIPS 2026 — Domain SFT Experiments
+# drift-loss NeurIPS 2026 — Domain SFT Experiments
 # ============================================================
 #
 # Battle B: Math SFT → General Knowledge Retention
@@ -25,7 +25,7 @@ RESULTS_DIR="${PROJECT_DIR}/results/paper"
 PHASE="${1:-all}"
 
 echo "============================================"
-echo "  Drift-Trust — Domain SFT Experiments"
+echo "  drift-loss — Domain SFT Experiments"
 echo "  Phase: ${PHASE}"
 echo "============================================"
 
@@ -111,7 +111,7 @@ phase_medical_train() {
             "${PAPER_CONFIGS}/ce_medical_4b.yaml"
     fi
 
-    # Drift-Trust
+    # drift-loss
     local drift_out="./outputs/paper/drift-medical-4b"
     if [ -d "${drift_out}" ] && [ -f "${drift_out}/config.json" ]; then
         echo "[train] Drift-Medical — SKIP (exists)"
