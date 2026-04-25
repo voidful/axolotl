@@ -37,6 +37,11 @@ METRIC_PRIORITY = {
         "acc_norm,none",
         "exact_match,none",
     ],
+    "medqa_4options": [
+        "acc,none",
+        "acc_norm,none",
+        "exact_match,none",
+    ],
 }
 
 
@@ -142,7 +147,15 @@ def fmt_delta(val: float | None) -> str:
 
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for key in ["eval_loss", "ifeval", "mmlu_pro", "ifeval_delta", "mmlu_pro_delta"]:
+    for key in [
+        "eval_loss",
+        "ifeval",
+        "mmlu_pro",
+        "medqa",
+        "ifeval_delta",
+        "mmlu_pro_delta",
+        "medqa_delta",
+    ]:
         mean, std = mean_std([r[key] for r in rows if r.get(key) is not None])
         out[f"{key}_mean"] = mean
         out[f"{key}_std"] = std
@@ -154,6 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_tag", default="fast_drift")
     parser.add_argument("--outputs", default="./outputs/paper/fast_drift")
     parser.add_argument("--results", default="./results/paper/fast_drift")
+    parser.add_argument("--methods", nargs="+", default=["ce", "drift"])
     parser.add_argument("--regimes", nargs="+", default=["medical", "noise25"])
     parser.add_argument("--seeds", nargs="+", default=["42"])
     return parser.parse_args()
@@ -168,22 +182,26 @@ def main() -> None:
 
     base_ifeval = load_benchmark(results_root, "base", "ifeval")
     base_mmlu = load_benchmark(results_root, "base", "mmlu_pro")
+    base_medqa = load_benchmark(results_root, "base", "medqa_4options")
     base = {
         "run": "base",
         "ifeval": base_ifeval["score"],
         "mmlu_pro": base_mmlu["score"],
+        "medqa": base_medqa["score"],
         "ifeval_metric": base_ifeval["metric"],
         "mmlu_pro_metric": base_mmlu["metric"],
+        "medqa_metric": base_medqa["metric"],
     }
 
     rows: list[dict[str, Any]] = []
     for regime in args.regimes:
         for seed in args.seeds:
-            for method in ["ce", "drift"]:
+            for method in args.methods:
                 run = run_name(args.run_tag, method, regime, seed)
                 output_dir = outputs_root / run
                 ifeval = load_benchmark(results_root, run, "ifeval")
                 mmlu = load_benchmark(results_root, run, "mmlu_pro")
+                medqa = load_benchmark(results_root, run, "medqa_4options")
                 row = {
                     "run": run,
                     "method": method,
@@ -192,8 +210,10 @@ def main() -> None:
                     "eval_loss": final_eval_loss(output_dir),
                     "ifeval": ifeval["score"],
                     "mmlu_pro": mmlu["score"],
+                    "medqa": medqa["score"],
                     "ifeval_metric": ifeval["metric"],
                     "mmlu_pro_metric": mmlu["metric"],
+                    "medqa_metric": medqa["metric"],
                     "ifeval_delta": (
                         ifeval["score"] - base["ifeval"]
                         if ifeval["score"] is not None and base["ifeval"] is not None
@@ -204,12 +224,17 @@ def main() -> None:
                         if mmlu["score"] is not None and base["mmlu_pro"] is not None
                         else None
                     ),
+                    "medqa_delta": (
+                        medqa["score"] - base["medqa"]
+                        if medqa["score"] is not None and base["medqa"] is not None
+                        else None
+                    ),
                 }
                 rows.append(row)
 
     grouped: dict[str, dict[str, Any]] = {}
     for regime in args.regimes:
-        for method in ["ce", "drift"]:
+        for method in args.methods:
             key = f"{method}:{regime}"
             grouped[key] = aggregate(
                 [r for r in rows if r["method"] == method and r["regime"] == regime]
@@ -232,11 +257,12 @@ def main() -> None:
     lines.append("")
     lines.append(f"- Base IFEval: {fmt_pct(base['ifeval'])} ({base['ifeval_metric'] or 'missing'})")
     lines.append(f"- Base MMLU-Pro: {fmt_pct(base['mmlu_pro'])} ({base['mmlu_pro_metric'] or 'missing'})")
+    lines.append(f"- Base MedQA: {fmt_pct(base['medqa'])} ({base['medqa_metric'] or 'missing'})")
     lines.append("")
-    lines.append("| Regime | Method | Target eval loss | IFEval | IFEval Δ | MMLU-Pro | MMLU-Pro Δ |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("| Regime | Method | Target eval loss | IFEval | IFEval Δ | MMLU-Pro | MMLU-Pro Δ | MedQA | MedQA Δ |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for regime in args.regimes:
-        for method in ["ce", "drift"]:
+        for method in args.methods:
             agg = grouped[f"{method}:{regime}"]
             lines.append(
                 "| "
@@ -249,6 +275,8 @@ def main() -> None:
                         fmt_delta(agg["ifeval_delta_mean"]),
                         fmt_pct(agg["mmlu_pro_mean"]),
                         fmt_delta(agg["mmlu_pro_delta_mean"]),
+                        fmt_pct(agg["medqa_mean"]),
+                        fmt_delta(agg["medqa_delta_mean"]),
                     ]
                 )
                 + " |"
@@ -257,8 +285,8 @@ def main() -> None:
     lines.append("")
     lines.append("## Per-Run")
     lines.append("")
-    lines.append("| Run | Target eval loss | IFEval | IFEval Δ | MMLU-Pro | MMLU-Pro Δ |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
+    lines.append("| Run | Target eval loss | IFEval | IFEval Δ | MMLU-Pro | MMLU-Pro Δ | MedQA | MedQA Δ |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for row in rows:
         lines.append(
             "| "
@@ -270,6 +298,8 @@ def main() -> None:
                     fmt_delta(row["ifeval_delta"]),
                     fmt_pct(row["mmlu_pro"]),
                     fmt_delta(row["mmlu_pro_delta"]),
+                    fmt_pct(row["medqa"]),
+                    fmt_delta(row["medqa_delta"]),
                 ]
             )
             + " |"
@@ -285,4 +315,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

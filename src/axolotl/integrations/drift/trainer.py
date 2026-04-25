@@ -35,6 +35,20 @@ from .loss import compute_drift_focal_loss
 LOG = get_logger(__name__)
 
 
+def _masked_summary(x: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+    """Return compact masked distribution stats for training logs."""
+    vals = x[mask]
+    if vals.numel() == 0:
+        return {"mean": 0.0, "q10": 0.0, "q50": 0.0, "q90": 0.0}
+    vals = vals.float()
+    return {
+        "mean": vals.mean().item(),
+        "q10": torch.quantile(vals, 0.1).item(),
+        "q50": torch.quantile(vals, 0.5).item(),
+        "q90": torch.quantile(vals, 0.9).item(),
+    }
+
+
 class AxolotlDriftTrainer(AxolotlTrainer):
     """
     drift-loss trainer with EMA or token-wise prior references.
@@ -155,7 +169,57 @@ class AxolotlDriftTrainer(AxolotlTrainer):
                 valid_mask=stats["shift_mask"],  # type: ignore[arg-type]
             )
 
+        self._log_drift_stats(stats)
+
         return (loss, outputs) if return_outputs else loss
+
+    def _log_drift_stats(self, stats: dict[str, object]) -> None:
+        """
+        Log compact drift-loss diagnostics for analysis and paper figures.
+
+        Kept trainer-local so the loss remains a pure tensor function.
+        """
+        if not hasattr(self, "state") or not hasattr(self, "log"):
+            return
+
+        logging_steps = max(getattr(self.args, "logging_steps", 1), 1)
+        if self.state.global_step % logging_steps != 0:
+            return
+
+        mask = stats.get("shift_mask")
+        if not torch.is_tensor(mask):
+            return
+
+        log_dict = {
+            "train/drift_reference": self.drift_buffer.state,
+        }
+
+        for key, prefix in [
+            ("w_t", "train/drift_w"),
+            ("u_t", "train/drift_u"),
+            ("delta_t", "train/drift_delta"),
+            ("ce_t", "train/drift_ce"),
+        ]:
+            value = stats.get(key)
+            if torch.is_tensor(value):
+                summary = _masked_summary(value, mask)
+                log_dict[f"{prefix}_mean"] = summary["mean"]
+                log_dict[f"{prefix}_q10"] = summary["q10"]
+                log_dict[f"{prefix}_q50"] = summary["q50"]
+                log_dict[f"{prefix}_q90"] = summary["q90"]
+
+        w_t = stats.get("w_t")
+        if torch.is_tensor(w_t):
+            w_masked = w_t[mask]
+            if w_masked.numel() > 0:
+                log_dict["train/drift_high_weight_frac"] = (
+                    (w_masked > 1.5).float().mean().item()
+                )
+                log_dict["train/drift_low_weight_frac"] = (
+                    (w_masked < 0.5).float().mean().item()
+                )
+
+        self.log(log_dict)
 
     @override
     def prediction_step(

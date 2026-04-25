@@ -42,6 +42,7 @@ NOISE_RATIO="${NOISE_RATIO:-0.25}"
 NOISE_PCT="${NOISE_PCT:-25}"
 SEEDS_STR="${SEEDS:-42}"
 REGIMES_STR="${REGIMES:-medical noise25}"
+METHODS_STR="${METHODS:-ce drift}"
 
 SEQ_LEN="${SEQ_LEN:-2048}"
 MICRO_BATCH="${MICRO_BATCH:-1}"
@@ -62,6 +63,7 @@ EVAL_LIMIT="${EVAL_LIMIT:-200}"          # empty string means full eval
 MMLU_FEWSHOT="${MMLU_FEWSHOT:-0}"        # use 5 for final/full runs
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-auto}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.86}"
+DOMAIN_EVAL="${DOMAIN_EVAL:-0}"
 
 DATA_DIR="${PROJECT_DIR}/data/paper/fast"
 CONFIG_DIR="${PROJECT_DIR}/examples/paper/fast_drift"
@@ -72,6 +74,7 @@ CACHE_DIR="${PROJECT_DIR}/tmp/hf_datasets_cache_${RUN_TAG}"
 
 read -r -a SEED_LIST <<< "${SEEDS_STR}"
 read -r -a REGIME_LIST <<< "${REGIMES_STR}"
+read -r -a METHOD_LIST <<< "${METHODS_STR}"
 
 mkdir -p "${DATA_DIR}" "${CONFIG_DIR}" "${OUTPUT_BASE}" "${PREPARED_BASE}" "${RESULTS_BASE}" "${CACHE_DIR}"
 
@@ -95,8 +98,12 @@ dataset_for_regime() {
         medical)
             echo "${DATA_DIR}/medical_flashcards_$((N_TRAIN / 1000))k.jsonl"
             ;;
-        noise25)
-            echo "${DATA_DIR}/ultrafeedback_noisy_${NOISE_PCT}pct_$((N_TRAIN / 1000))k.jsonl"
+        math)
+            echo "${DATA_DIR}/numina_math_cot_$((N_TRAIN / 1000))k.jsonl"
+            ;;
+        noise*)
+            local pct="${regime#noise}"
+            echo "${DATA_DIR}/ultrafeedback_noisy_${pct}pct_$((N_TRAIN / 1000))k.jsonl"
             ;;
         *)
             echo "Unknown regime: ${regime}" >&2
@@ -136,28 +143,39 @@ prepared_dir() {
 phase_data() {
     log "Preparing ${N_TRAIN}-sample datasets"
 
-    local medical_path
-    medical_path="$(dataset_for_regime medical)"
-    if [[ ! -f "${medical_path}" ]]; then
-        python3 "${SCRIPT_DIR}/create_medical_sft.py" \
-            --output_dir "${DATA_DIR}" \
-            --num_samples "${N_TRAIN}" \
-            --seed 42
-    else
-        echo "[data] exists: ${medical_path}"
-    fi
+    for regime in "${REGIME_LIST[@]}"; do
+        local data_path
+        data_path="$(dataset_for_regime "${regime}")"
+        if [[ -f "${data_path}" ]]; then
+            echo "[data] exists: ${data_path}"
+            continue
+        fi
 
-    local noise_path
-    noise_path="$(dataset_for_regime noise25)"
-    if [[ ! -f "${noise_path}" ]]; then
-        python3 "${SCRIPT_DIR}/create_noisy_ultrafeedback.py" \
-            --output_dir "${DATA_DIR}" \
-            --num_samples "${N_TRAIN}" \
-            --noise_ratio "${NOISE_RATIO}" \
-            --seed 42
-    else
-        echo "[data] exists: ${noise_path}"
-    fi
+        case "${regime}" in
+            medical)
+                python3 "${SCRIPT_DIR}/create_medical_sft.py" \
+                    --output_dir "${DATA_DIR}" \
+                    --num_samples "${N_TRAIN}" \
+                    --seed 42
+                ;;
+            math)
+                python3 "${SCRIPT_DIR}/sample_numina_math.py" \
+                    --output_dir "${DATA_DIR}" \
+                    --num_samples "${N_TRAIN}" \
+                    --seed 42
+                ;;
+            noise*)
+                local pct="${regime#noise}"
+                local ratio
+                ratio="$(python3 -c "print(${pct} / 100.0)")"
+                python3 "${SCRIPT_DIR}/create_noisy_ultrafeedback.py" \
+                    --output_dir "${DATA_DIR}" \
+                    --num_samples "${N_TRAIN}" \
+                    --noise_ratio "${ratio}" \
+                    --seed 42
+                ;;
+        esac
+    done
 }
 
 write_config() {
@@ -291,8 +309,9 @@ phase_train() {
     log "Training CE and single drift-loss"
     for regime in "${REGIME_LIST[@]}"; do
         for seed in "${SEED_LIST[@]}"; do
-            train_one "ce" "${regime}" "${seed}"
-            train_one "drift" "${regime}" "${seed}"
+            for method in "${METHOD_LIST[@]}"; do
+                train_one "${method}" "${regime}" "${seed}"
+            done
         done
     done
 }
@@ -324,8 +343,9 @@ phase_merge() {
     log "Merging adapters for vLLM/full-model evaluation"
     for regime in "${REGIME_LIST[@]}"; do
         for seed in "${SEED_LIST[@]}"; do
-            merge_one "ce" "${regime}" "${seed}"
-            merge_one "drift" "${regime}" "${seed}"
+            for method in "${METHOD_LIST[@]}"; do
+                merge_one "${method}" "${regime}" "${seed}"
+            done
         done
     done
 }
@@ -391,11 +411,15 @@ lm_eval_one_task() {
 eval_one() {
     local run="$1"
     local model_path="$2"
+    local regime="$3"
     local model_args
 
     model_args="$(eval_model_args "${model_path}")"
     lm_eval_one_task "${run}" "${model_args}" "ifeval" 0
     lm_eval_one_task "${run}" "${model_args}" "mmlu_pro" "${MMLU_FEWSHOT}"
+    if [[ "${DOMAIN_EVAL}" == "1" && "${regime}" == "medical" ]]; then
+        lm_eval_one_task "${run}" "${model_args}" "medqa_4options" 0
+    fi
 }
 
 phase_eval() {
@@ -409,10 +433,13 @@ phase_eval() {
     base_args="$(eval_base_args)"
     lm_eval_one_task "base" "${base_args}" "ifeval" 0
     lm_eval_one_task "base" "${base_args}" "mmlu_pro" "${MMLU_FEWSHOT}"
+    if [[ "${DOMAIN_EVAL}" == "1" ]]; then
+        lm_eval_one_task "base" "${base_args}" "medqa_4options" 0
+    fi
 
     for regime in "${REGIME_LIST[@]}"; do
         for seed in "${SEED_LIST[@]}"; do
-            for method in ce drift; do
+            for method in "${METHOD_LIST[@]}"; do
                 local run
                 local out
                 local eval_path
@@ -430,7 +457,7 @@ phase_eval() {
                     echo "[eval] skip missing: ${eval_path}"
                     continue
                 fi
-                eval_one "${run}" "${eval_path}"
+                eval_one "${run}" "${eval_path}" "${regime}"
             done
         done
     done
@@ -442,6 +469,7 @@ phase_summary() {
         --run_tag "${RUN_TAG}" \
         --outputs "${OUTPUT_BASE}" \
         --results "${RESULTS_BASE}" \
+        --methods ${METHODS_STR} \
         --regimes ${REGIMES_STR} \
         --seeds ${SEEDS_STR}
 }
