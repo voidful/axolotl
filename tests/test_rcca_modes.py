@@ -19,7 +19,12 @@ from axolotl.integrations.rcca_tr.loss import (
     compute_drift_trust_s_loss,
     compute_drift_trust_a_loss,
     compute_hardness_loss,
+    compute_module_routing_losses,
     compute_rcca_loss,
+    compute_soft_stm_loss,
+    compute_stm_topk_loss,
+    compute_token_role_gates,
+    compute_token_triage_loss,
     compute_self_paced_score,
     compute_suppressive_drift_score,
     compute_anchoring_drift_score,
@@ -49,6 +54,14 @@ def dummy_drift(dummy_data):
     logits, labels = dummy_data
     B, T = labels.shape
     return torch.randn(B, T) * 0.5
+
+
+@pytest.fixture
+def dummy_base_logits(dummy_data):
+    """Create frozen-base logits that differ from active logits."""
+    logits, _ = dummy_data
+    torch.manual_seed(123)
+    return logits.detach() + torch.randn_like(logits) * 0.25
 
 
 # ── Test 1: All modes produce valid scalar loss ───────────────────────
@@ -109,6 +122,27 @@ class TestAllModesForward:
             assert loss.dim() == 0, f"Legacy alias {mode} did not return scalar"
             assert torch.isfinite(loss), f"Legacy alias {mode} returned non-finite loss"
 
+    def test_base_aware_modes(self, dummy_data, dummy_base_logits):
+        logits, labels = dummy_data
+        for mode in (
+            "stm_top20",
+            "soft_stm",
+            "retention_kl",
+            "learn_new",
+            "module_aware_retention",
+            "fullft_module_aware_retention",
+            "attention_only_new",
+        ):
+            loss, stats = compute_rcca_loss(
+                mode=mode,
+                logits=logits,
+                labels=labels,
+                base_logits=dummy_base_logits,
+            )
+            assert loss.dim() == 0, f"{mode} did not return scalar"
+            assert torch.isfinite(loss), f"{mode} returned non-finite loss"
+            assert "base_nll_t" in stats
+
 
 # ── Test 2: Drift-Trust-S weight bounds ───────────────────────────────
 
@@ -167,6 +201,74 @@ class TestDriftTrustAWeightBounds:
         mask = labels[..., 1:] != -100
         w_valid = w_t[mask]
         assert w_valid.max() > 1.0, "Drift-Trust-A should amplify some tokens above 1.0"
+
+
+class TestBaseAwareModes:
+    """Base-aware methods must produce sane gates and weights."""
+
+    def test_stm_masks_tail(self, dummy_data, dummy_base_logits):
+        logits, labels = dummy_data
+        _, stats = compute_stm_topk_loss(
+            logits,
+            labels,
+            dummy_base_logits,
+            keep_ratio=0.8,
+        )
+        mask = labels[..., 1:] != -100
+        w_valid = stats["w_t"][mask]
+        assert set(w_valid.unique().tolist()).issubset({0.0, 1.0})
+        assert (w_valid == 0).any()
+
+    def test_soft_stm_range(self, dummy_data, dummy_base_logits):
+        logits, labels = dummy_data
+        _, stats = compute_soft_stm_loss(logits, labels, dummy_base_logits)
+        mask = labels[..., 1:] != -100
+        w_valid = stats["w_t"][mask]
+        assert w_valid.min() >= 0.0
+        assert w_valid.max() <= 1.0
+
+    def test_token_role_gate_range(self, dummy_data, dummy_base_logits):
+        _, labels = dummy_data
+        mask = labels[..., 1:] != -100
+        safe_labels = labels[..., 1:].clamp(min=0)
+        target_logit = dummy_base_logits[..., :-1, :].gather(
+            -1, safe_labels.unsqueeze(-1)
+        ).squeeze(-1)
+        base_nll = -(target_logit - torch.logsumexp(dummy_base_logits[..., :-1, :], dim=-1))
+        r_t, a_t, n_t, _ = compute_token_role_gates(base_nll, mask)
+        for gate in (r_t, a_t, n_t):
+            assert gate.min() >= 0.0
+            assert gate.max() <= 1.0
+
+    def test_triage_weight_bounds(self, dummy_data, dummy_base_logits):
+        logits, labels = dummy_data
+        _, stats = compute_token_triage_loss(
+            logits,
+            labels,
+            dummy_base_logits,
+            w_floor=0.1,
+            w_max=3.0,
+            kl_beta=0.05,
+        )
+        mask = labels[..., 1:] != -100
+        w_valid = stats["w_t"][mask]
+        assert w_valid.min() >= 0.1 - 1e-6
+        assert w_valid.max() <= 3.0 + 1e-6
+        assert "kl_t" in stats
+
+    def test_module_routing_losses(self, dummy_data, dummy_base_logits):
+        logits, labels = dummy_data
+        losses, stats = compute_module_routing_losses(
+            logits,
+            labels,
+            dummy_base_logits,
+        )
+        for key in ("loss", "attn_loss", "mlp_loss", "other_loss"):
+            assert key in losses
+            assert losses[key].dim() == 0
+            assert torch.isfinite(losses[key])
+        for key in ("w_attn_t", "w_mlp_t", "w_other_t", "R_t", "A_t", "N_t"):
+            assert key in stats
 
 
 # ── Test 4: DriftBuffer update monotonicity ───────────────────────────
@@ -288,3 +390,19 @@ class TestErrorHandling:
         logits, labels = dummy_data
         with pytest.raises(ValueError, match="requires drift tensor"):
             compute_rcca_loss(mode="drift_trust_a", logits=logits, labels=labels, drift=None)
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "stm_top20",
+            "soft_stm",
+            "retention_kl",
+            "learn_new",
+            "module_aware_retention",
+            "fullft_module_aware_retention",
+        ],
+    )
+    def test_base_aware_without_base_raises(self, dummy_data, mode):
+        logits, labels = dummy_data
+        with pytest.raises(ValueError, match="requires base_logits"):
+            compute_rcca_loss(mode=mode, logits=logits, labels=labels, base_logits=None)

@@ -13,28 +13,13 @@
 # limitations under the License.
 
 """
-Plugin init for Drift-Trust.
+Plugin init for RCCA-TR.
 
-A token-level regularization family built on a shared drift signal
-and two transfer functions for post-training knowledge preservation.
-
-Four modes (controlled by ``rcca_tr_mode``):
-
-  ce            — Standard cross-entropy baseline.
-  hardness      — Self-paced hardness weighting only (ablation).
-  drift_trust_s — Suppressive mapping (best for noisy alignment).
-  drift_trust_a — Anchoring mapping (best for clean domain specialization).
-
-Shared drift signal:
-  d_t = log p_θ(y_t) − running_mean     [temporal drift]
-
-Drift-Trust-S (suppressive):
-  w_t = w_min + (1 - w_min) · (β · s_t + (1 - β) · r_t)
-  w_t ∈ [0.05, 1.0]
-
-Drift-Trust-A (anchoring):
-  w_t = w_0 + λ · r_t
-  w_t ∈ [0.1, 4.1]
+The current research path is full fine-tuning with base-aware token role
+triage and module-routed gradients. ``module_aware_retention`` and
+``fullft_module_aware_retention`` use a frozen reference model to assign token
+roles, then route acquisition-heavy loss into attention and retention-heavy
+loss into MLP/other parameters.
 """
 
 from axolotl.integrations.base import BasePlugin
@@ -47,10 +32,7 @@ LOG = get_logger(__name__)
 
 class RCCATRPlugin(BasePlugin):
     """
-    Plugin for Drift-Trust.
-
-    Memory: ~1× model size (just the active model).
-    Evidence drift is tracked via a lightweight scalar EMA buffer.
+    Plugin for RCCA-TR.
     """
 
     def get_input_args(self):
@@ -78,4 +60,32 @@ class RCCATRPlugin(BasePlugin):
             "rcca_tr_anchor_base": cfg.rcca_tr_anchor_base,
             "rcca_tr_anchor_lambda": cfg.rcca_tr_anchor_lambda,
             "rcca_tr_reliability_tau": cfg.rcca_tr_reliability_tau,
+            "rcca_tr_tau_old": cfg.rcca_tr_tau_old,
+            "rcca_tr_tau_new": cfg.rcca_tr_tau_new,
+            "rcca_tr_tau_noise": cfg.rcca_tr_tau_noise,
+            "rcca_tr_gate_temperature": cfg.rcca_tr_gate_temperature,
+            "rcca_tr_old_quantile": cfg.rcca_tr_old_quantile,
+            "rcca_tr_new_quantile": cfg.rcca_tr_new_quantile,
+            "rcca_tr_noise_quantile": cfg.rcca_tr_noise_quantile,
+            "rcca_tr_stm_keep_ratio": cfg.rcca_tr_stm_keep_ratio,
+            "rcca_tr_lambda_acquire": cfg.rcca_tr_lambda_acquire,
+            "rcca_tr_mu_noise": cfg.rcca_tr_mu_noise,
+            "rcca_tr_rho_retention": cfg.rcca_tr_rho_retention,
+            "rcca_tr_triage_w_floor": cfg.rcca_tr_triage_w_floor,
+            "rcca_tr_triage_w_max": cfg.rcca_tr_triage_w_max,
+            "rcca_tr_kl_beta": cfg.rcca_tr_kl_beta,
+            "rcca_tr_kl_chunk_size": cfg.rcca_tr_kl_chunk_size,
+            "rcca_tr_reference_model": cfg.rcca_tr_reference_model,
+            "rcca_tr_attn_lambda_acquire": cfg.rcca_tr_attn_lambda_acquire,
+            "rcca_tr_attn_mu_noise": cfg.rcca_tr_attn_mu_noise,
+            "rcca_tr_attn_rho_retention": cfg.rcca_tr_attn_rho_retention,
+            "rcca_tr_attn_kl_beta": cfg.rcca_tr_attn_kl_beta,
+            "rcca_tr_mlp_lambda_acquire": cfg.rcca_tr_mlp_lambda_acquire,
+            "rcca_tr_mlp_mu_noise": cfg.rcca_tr_mlp_mu_noise,
+            "rcca_tr_mlp_rho_retention": cfg.rcca_tr_mlp_rho_retention,
+            "rcca_tr_mlp_kl_beta": cfg.rcca_tr_mlp_kl_beta,
+            "rcca_tr_other_lambda_acquire": cfg.rcca_tr_other_lambda_acquire,
+            "rcca_tr_other_mu_noise": cfg.rcca_tr_other_mu_noise,
+            "rcca_tr_other_rho_retention": cfg.rcca_tr_other_rho_retention,
+            "rcca_tr_other_kl_beta": cfg.rcca_tr_other_kl_beta,
         }

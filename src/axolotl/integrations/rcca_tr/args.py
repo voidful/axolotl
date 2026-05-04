@@ -42,7 +42,10 @@ class RCCATRArgs(BaseModel):
     # --- Method mode ---
     rcca_tr_mode: Optional[Literal[
         "ce", "hardness", "drift_trust_s", "drift_trust_a",
-        # Legacy aliases (backward compat with existing configs)
+        "stm_top20", "soft_stm", "retention_kl", "learn_new",
+        "module_aware_retention", "fullft_module_aware_retention",
+        "attention_only_new",
+        # Legacy drift aliases
         "drift_only", "drift",
     ]] = "drift_trust_s"
 
@@ -61,6 +64,38 @@ class RCCATRArgs(BaseModel):
     rcca_tr_anchor_lambda: Optional[float] = 4.0  # amplification factor λ
     rcca_tr_reliability_tau: Optional[float] = 1.0 # sigmoid temperature for r_t
 
+    # --- Base-aware token triage hyperparameters ---
+    rcca_tr_tau_old: Optional[float] = None       # explicit old-known NLL threshold
+    rcca_tr_tau_new: Optional[float] = None       # explicit new-token NLL threshold
+    rcca_tr_tau_noise: Optional[float] = None     # explicit high-noise NLL threshold
+    rcca_tr_gate_temperature: Optional[float] = 1.0
+    rcca_tr_old_quantile: Optional[float] = 0.4
+    rcca_tr_new_quantile: Optional[float] = 0.6
+    rcca_tr_noise_quantile: Optional[float] = 0.95
+    rcca_tr_stm_keep_ratio: Optional[float] = 0.8
+    rcca_tr_lambda_acquire: Optional[float] = 1.0
+    rcca_tr_mu_noise: Optional[float] = 1.0
+    rcca_tr_rho_retention: Optional[float] = 0.5
+    rcca_tr_triage_w_floor: Optional[float] = 0.1
+    rcca_tr_triage_w_max: Optional[float] = 3.0
+    rcca_tr_kl_beta: Optional[float] = 0.05
+    rcca_tr_kl_chunk_size: Optional[int] = 256
+
+    # --- Full-FT module-routed objective ---
+    rcca_tr_reference_model: Optional[str] = None
+    rcca_tr_attn_lambda_acquire: Optional[float] = 1.0
+    rcca_tr_attn_mu_noise: Optional[float] = 1.0
+    rcca_tr_attn_rho_retention: Optional[float] = 0.0
+    rcca_tr_attn_kl_beta: Optional[float] = 0.0
+    rcca_tr_mlp_lambda_acquire: Optional[float] = 0.5
+    rcca_tr_mlp_mu_noise: Optional[float] = 1.0
+    rcca_tr_mlp_rho_retention: Optional[float] = 0.5
+    rcca_tr_mlp_kl_beta: Optional[float] = 0.05
+    rcca_tr_other_lambda_acquire: Optional[float] = 0.25
+    rcca_tr_other_mu_noise: Optional[float] = 1.0
+    rcca_tr_other_rho_retention: Optional[float] = 0.75
+    rcca_tr_other_kl_beta: Optional[float] = 0.05
+
 
 @dataclass
 class RCCATRTrainingArgsMixin:
@@ -78,3 +113,31 @@ class RCCATRTrainingArgsMixin:
     rcca_tr_anchor_base: Optional[float] = 0.1
     rcca_tr_anchor_lambda: Optional[float] = 4.0
     rcca_tr_reliability_tau: Optional[float] = 1.0
+    rcca_tr_tau_old: Optional[float] = None
+    rcca_tr_tau_new: Optional[float] = None
+    rcca_tr_tau_noise: Optional[float] = None
+    rcca_tr_gate_temperature: Optional[float] = 1.0
+    rcca_tr_old_quantile: Optional[float] = 0.4
+    rcca_tr_new_quantile: Optional[float] = 0.6
+    rcca_tr_noise_quantile: Optional[float] = 0.95
+    rcca_tr_stm_keep_ratio: Optional[float] = 0.8
+    rcca_tr_lambda_acquire: Optional[float] = 1.0
+    rcca_tr_mu_noise: Optional[float] = 1.0
+    rcca_tr_rho_retention: Optional[float] = 0.5
+    rcca_tr_triage_w_floor: Optional[float] = 0.1
+    rcca_tr_triage_w_max: Optional[float] = 3.0
+    rcca_tr_kl_beta: Optional[float] = 0.05
+    rcca_tr_kl_chunk_size: Optional[int] = 256
+    rcca_tr_reference_model: Optional[str] = None
+    rcca_tr_attn_lambda_acquire: Optional[float] = 1.0
+    rcca_tr_attn_mu_noise: Optional[float] = 1.0
+    rcca_tr_attn_rho_retention: Optional[float] = 0.0
+    rcca_tr_attn_kl_beta: Optional[float] = 0.0
+    rcca_tr_mlp_lambda_acquire: Optional[float] = 0.5
+    rcca_tr_mlp_mu_noise: Optional[float] = 1.0
+    rcca_tr_mlp_rho_retention: Optional[float] = 0.5
+    rcca_tr_mlp_kl_beta: Optional[float] = 0.05
+    rcca_tr_other_lambda_acquire: Optional[float] = 0.25
+    rcca_tr_other_mu_noise: Optional[float] = 1.0
+    rcca_tr_other_rho_retention: Optional[float] = 0.75
+    rcca_tr_other_kl_beta: Optional[float] = 0.05
